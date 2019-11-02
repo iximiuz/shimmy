@@ -11,3 +11,8 @@ Similar projects:
 - <a href="https://github.com/containers/conmon">conmon</a>
 - <a href="https://github.com/containerd/containerd/blob/master/runtime/v2/shim.go">containerd runtime shim</a>
 
+## TODO:
+- Keep the state of the program in a struct instead of global vars.
+- Implement the shim as FSM by defining each state and transitions.
+- git diff 8392df88fba944510b51c7d5b92aa745a15863f8..HEAD
+
