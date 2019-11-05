@@ -3,7 +3,11 @@ use std::path::Path;
 use std::process::exit;
 
 use libc::_exit;
-use nix::unistd::{close, dup2, fork, getpid, getppid, pipe, read, ForkResult, Pid};
+use nix::sys::signal::Signal;
+use nix::unistd::{fork, ForkResult, Pid};
+
+mod nixtools;
+use nixtools::{set_child_subreaper, set_parent_death_signal, setsid};
 
 fn main() {
     // parse args
@@ -16,8 +20,8 @@ fn main() {
             write_pid_file_and_exit("/home/vagrant/shimmy/pidfile.pid", child);
         }
         Ok(ForkResult::Child) => {
-            // setsid
-            // set subreaper
+            setsid();
+            set_child_subreaper();
             // make pipes for runc stdout/stderr
             // block SIGINT, SIGQUIT, SIGTERM
 
@@ -31,7 +35,7 @@ fn main() {
                     //   dump exit code on runc exit
                 }
                 Ok(ForkResult::Child) => {
-                    // set PDEATH (and check does it still work after exec)
+                    set_parent_death_signal(Signal::SIGKILL); // TODO: check does it still work after exec)
                     // unblock signals
                     // dup std streams
                     exec_oci_runtime_or_exit();
