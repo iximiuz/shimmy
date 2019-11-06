@@ -3,11 +3,13 @@ use std::path::Path;
 use std::process::exit;
 
 use libc::_exit;
-use nix::sys::signal::Signal;
+use nix::sys::signal::Signal::{SIGINT, SIGKILL, SIGQUIT, SIGTERM};
 use nix::unistd::{fork, ForkResult, Pid};
 
 mod nixtools;
-use nixtools::{set_child_subreaper, set_parent_death_signal, setsid};
+use nixtools::{
+    set_child_subreaper, set_parent_death_signal, setsid, signals_block, signals_restore,
+};
 
 fn main() {
     // parse args
@@ -23,7 +25,7 @@ fn main() {
             setsid();
             set_child_subreaper();
             // make pipes for runc stdout/stderr
-            // block SIGINT, SIGQUIT, SIGTERM
+            let oldmask = signals_block(&[SIGINT, SIGQUIT, SIGTERM]);
 
             match fork() {
                 Err(err) => {
@@ -35,8 +37,8 @@ fn main() {
                     //   dump exit code on runc exit
                 }
                 Ok(ForkResult::Child) => {
-                    set_parent_death_signal(Signal::SIGKILL); // TODO: check does it still work after exec)
-                    // unblock signals
+                    set_parent_death_signal(SIGKILL); // TODO: check does it still work after exec)
+                    signals_restore(&oldmask);
                     // dup std streams
                     exec_oci_runtime_or_exit();
                 }

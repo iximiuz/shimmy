@@ -1,6 +1,6 @@
 use libc::{self, c_int, c_ulong};
 use nix::errno::Errno;
-use nix::sys::signal::Signal;
+use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow, Signal};
 use nix::unistd::{self};
 use nix::Result;
 
@@ -14,6 +14,20 @@ pub fn set_parent_death_signal(sig: Signal) {
 
 pub fn setsid() {
     unistd::setsid().expect("must always succeed, see man 2 sessid");
+}
+
+pub fn signals_block(signals: &[Signal]) -> SigSet {
+    let mut newmask = SigSet::empty();
+    for s in signals {
+        newmask.add(*s);
+    }
+    let mut oldmask = SigSet::empty();
+    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&newmask), Some(&mut oldmask)).expect("ooops");
+    return oldmask;
+}
+
+pub fn signals_restore(mask: &SigSet) {
+    sigprocmask(SigmaskHow::SIG_SETMASK, Some(&mask), None).expect("ooops");
 }
 
 #[repr(i32)]
@@ -33,4 +47,3 @@ fn prctl(
     let res = unsafe { libc::prctl(option as c_int, arg2, arg3, arg4, arg5) };
     Errno::result(res).map(drop)
 }
-
