@@ -3,8 +3,10 @@ use std::path::Path;
 use std::process::exit;
 
 use libc::_exit;
+use nix::fcntl::{OFlag, open};
 use nix::sys::signal::Signal::{SIGINT, SIGKILL, SIGQUIT, SIGTERM};
-use nix::unistd::{fork, ForkResult, Pid};
+use nix::sys::stat::Mode;
+use nix::unistd::{ForkResult, Pid, dup2, fork};
 
 mod nixtools;
 use nixtools::{
@@ -22,6 +24,7 @@ fn main() {
             write_pid_file_and_exit("/home/vagrant/shimmy/pidfile.pid", child);
         }
         Ok(ForkResult::Child) => {
+            null_std_streams();
             setsid();
             set_child_subreaper();
             // make pipes for runc stdout/stderr
@@ -62,4 +65,13 @@ fn exec_oci_runtime_or_exit() {
     unsafe {
         _exit(127);
     }
+}
+
+fn null_std_streams() {
+    let dev_null_r = open("/dev/null", OFlag::O_RDONLY, Mode::empty()).expect("oops");
+    let dev_null_w = open("/dev/null", OFlag::O_WRONLY, Mode::empty()).expect("oops");
+
+    dup2(dev_null_r, 0).expect("oops");
+    dup2(dev_null_w, 1).expect("oops");
+    dup2(dev_null_w, 2).expect("oops");
 }
