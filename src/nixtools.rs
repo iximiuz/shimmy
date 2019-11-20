@@ -7,31 +7,6 @@ use nix::unistd::{close, dup2, pipe2, setsid};
 use nix::Result;
 use std::os::unix::io::RawFd;
 
-pub fn null_stdio_streams() {
-    let dev_null_r = open(
-        "/dev/null",
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .expect("open('/dev/null') for reading failed");
-
-    let dev_null_w = open(
-        "/dev/null",
-        OFlag::O_WRONLY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .expect("open('/dev/null') for writing failed");
-
-    set_stdio_streams(STDIO {
-        IN: Some(dev_null_r),
-        OUT: Some(dev_null_w),
-        ERR: Some(dev_null_w),
-    });
-
-    close(dev_null_r).expect("close('/dev/null (RD)') failed");
-    close(dev_null_w).expect("close('/dev/null (WR)') failed");
-}
-
 pub struct Pipe {
     rd: RawFd,
     wr: RawFd,
@@ -48,7 +23,7 @@ impl Pipe {
 
 pub fn create_pipe() -> Pipe {
     let (rd, wr) = pipe2(OFlag::O_CLOEXEC).expect("pipe2() failed");
-    Pipe{ rd, wr }
+    Pipe { rd, wr }
 }
 
 pub fn session_start() {
@@ -65,21 +40,67 @@ pub fn set_parent_death_signal(sig: Signal) {
         .expect("prctl(PR_SET_PDEATHSIG) failed");
 }
 
-pub struct STDIO {
-    pub IN: Option<RawFd>,
-    pub OUT: Option<RawFd>,
-    pub ERR: Option<RawFd>,
+pub enum Std {
+    In,
+    Out,
+    Err,
 }
 
-pub fn set_stdio_streams(streams: STDIO) {
-    if let Some(fd) = streams.IN {
-        dup2(fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
+pub enum To {
+    DevNull,
+    Fd(RawFd),
+}
+
+pub struct Stream(pub Std, pub To);
+
+pub fn set_stdio(streams: &[Stream]) {
+    for s in streams {
+        match s {
+            Stream(Std::In, To::Fd(fd)) => {
+                dup2(*fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
+            }
+
+            Stream(Std::In, To::DevNull) => {
+                let fd = open_dev_null(OFlag::O_RDONLY);
+                dup2(fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
+                close(fd).expect("close('/dev/null (RDONLY)') failed");
+            }
+
+            Stream(Std::Out, To::Fd(fd)) => {
+                dup2(*fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
+            }
+
+            Stream(Std::Out, To::DevNull) => {
+                let fd = open_dev_null(OFlag::O_WRONLY);
+                dup2(fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
+                close(fd).expect("close('/dev/null (WRONLY)') failed");
+            }
+
+            Stream(Std::Err, To::Fd(fd)) => {
+                dup2(*fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
+            }
+
+            Stream(Std::Err, To::DevNull) => {
+                let fd = open_dev_null(OFlag::O_WRONLY);
+                dup2(fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
+                close(fd).expect("close('/dev/null (WRONLY)') failed");
+            }
+        };
     }
-    if let Some(fd) = streams.OUT {
-        dup2(fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
-    }
-    if let Some(fd) = streams.ERR {
-        dup2(fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
+}
+
+fn open_dev_null(flags: OFlag) -> RawFd {
+    open("/dev/null", flags | OFlag::O_CLOEXEC, Mode::empty()).expect(&format!(
+        "open('/dev/null') for {} failed",
+        human_readable_mode(flags)
+    ))
+}
+
+fn human_readable_mode(flags: OFlag) -> &'static str {
+    match flags {
+        _ if flags & OFlag::O_RDONLY == OFlag::O_RDONLY => "reading",
+        _ if flags & OFlag::O_WRONLY == OFlag::O_WRONLY => "writing",
+        _ => unreachable!(),
     }
 }
 
