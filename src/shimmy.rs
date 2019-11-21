@@ -36,21 +36,21 @@ fn main() {
             set_child_subreaper();
 
             let iopipes = StdioPipes::new();
-            let oldmask = signals_block(&[SIGINT, SIGQUIT, SIGTERM]);
+            let sigmask = signals_block(&[SIGINT, SIGQUIT, SIGTERM]);
 
             match fork() {
                 Ok(ForkResult::Child) => {
                     // Container runtime process
                     // TODO: check does it still work after exec)
                     set_parent_death_signal(SIGKILL);
-                    signals_restore(&oldmask);
+                    signals_restore(&sigmask);
                     set_stdio(iopipes.slave);
                     exec_oci_runtime_or_die();
                 }
                 Ok(ForkResult::Parent { .. }) => {
                     // Shim process
                     // TODO: set exit signal handlers before restoring the mask
-                    signals_restore(&oldmask);
+                    signals_restore(&sigmask);
                     iopipes.slave.close_all();
                     start_shim_server(iopipes.master);
                 }
@@ -66,6 +66,16 @@ fn main() {
 }
 
 fn start_shim_server(runtime_stdio: IOStreams) {
+    // TODO:
+    // set SIGCHLD
+    // waitpid(runtime_pid)
+    // if runtime exit code != 0 report error (using ENV[SYNC_FD]) and exit
+    // read container pid file (runc was supposed to store it on disk before exiting)
+    // report container pid back to the parent (using ENV[SYNC_FD])
+    // waitpid(container pid)
+    // set up container execution timeout if needed
+    // mio->run();
+    // report container exit code to the parent (using ENV[SYNC_FD])
     if let IOStream::Fd(fd) = runtime_stdio.Err {
         let mut buf = vec![0; 1024];
         let nread = read(fd, buf.as_mut_slice()).unwrap();
