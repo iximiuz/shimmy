@@ -40,52 +40,49 @@ pub fn set_parent_death_signal(sig: Signal) {
         .expect("prctl(PR_SET_PDEATHSIG) failed");
 }
 
-pub enum Std {
-    In,
-    Out,
-    Err,
-}
-
-pub enum To {
+pub enum IOStream {
     DevNull,
     Fd(RawFd),
 }
 
-pub struct Stream(pub Std, pub To);
+pub struct IOStreams {
+    pub In: IOStream,
+    pub Out: IOStream,
+    pub Err: IOStream,
+}
 
-pub fn set_stdio(streams: &[Stream]) {
-    for s in streams {
-        match s {
-            Stream(Std::In, To::Fd(fd)) => {
-                dup2(*fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
-            }
+pub fn set_stdio(streams: IOStreams) {
+    match streams.In {
+        IOStream::Fd(fd) => {
+            dup2(fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
+        }
+        IOStream::DevNull => {
+            let fd = open_dev_null(OFlag::O_RDONLY);
+            dup2(fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
+            close(fd).expect("close('/dev/null (RDONLY)') failed");
+        }
+    }
 
-            Stream(Std::In, To::DevNull) => {
-                let fd = open_dev_null(OFlag::O_RDONLY);
-                dup2(fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
-                close(fd).expect("close('/dev/null (RDONLY)') failed");
-            }
+    match streams.Out {
+        IOStream::Fd(fd) => {
+            dup2(fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
+        }
+        IOStream::DevNull => {
+            let fd = open_dev_null(OFlag::O_WRONLY);
+            dup2(fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
+            close(fd).expect("close('/dev/null (WRONLY)') failed");
+        }
+    }
 
-            Stream(Std::Out, To::Fd(fd)) => {
-                dup2(*fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
-            }
-
-            Stream(Std::Out, To::DevNull) => {
-                let fd = open_dev_null(OFlag::O_WRONLY);
-                dup2(fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
-                close(fd).expect("close('/dev/null (WRONLY)') failed");
-            }
-
-            Stream(Std::Err, To::Fd(fd)) => {
-                dup2(*fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
-            }
-
-            Stream(Std::Err, To::DevNull) => {
-                let fd = open_dev_null(OFlag::O_WRONLY);
-                dup2(fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
-                close(fd).expect("close('/dev/null (WRONLY)') failed");
-            }
-        };
+    match streams.Err {
+        IOStream::Fd(fd) => {
+            dup2(fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
+        }
+        IOStream::DevNull => {
+            let fd = open_dev_null(OFlag::O_WRONLY);
+            dup2(fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
+            close(fd).expect("close('/dev/null (WRONLY)') failed");
+        }
     }
 }
 

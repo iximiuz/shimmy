@@ -11,7 +11,7 @@ use nix::unistd::{close, execv, fork, read, ForkResult, Pid};
 mod nixtools;
 use nixtools::{
     create_pipe, session_start, set_child_subreaper, set_parent_death_signal, set_stdio,
-    signals_block, signals_restore, Pipe, Std, Stream, To,
+    signals_block, signals_restore, Pipe, IOStream, IOStreams,
 };
 
 fn main() {
@@ -25,11 +25,11 @@ fn main() {
         }
         Ok(ForkResult::Child) => {
             // Shim process
-            set_stdio(&[
-                Stream(Std::In, To::DevNull),
-                Stream(Std::Out, To::DevNull),
-                Stream(Std::Err, To::DevNull),
-            ]);
+            set_stdio(IOStreams{
+                In: IOStream::DevNull,
+                Out: IOStream::DevNull,
+                Err: IOStream::DevNull,
+            });
             session_start();
             set_child_subreaper();
 
@@ -42,11 +42,11 @@ fn main() {
                     // TODO: check does it still work after exec)
                     set_parent_death_signal(SIGKILL);
                     signals_restore(&oldmask);
-                    set_stdio(&[
-                        Stream(Std::In, To::DevNull),
-                        Stream(Std::Out, To::Fd(pipes.stdout.wr())),
-                        Stream(Std::Err, To::Fd(pipes.stderr.wr())),
-                    ]);
+                    set_stdio(IOStreams{
+                        In: IOStream::DevNull,
+                        Out: IOStream::Fd(pipes.stdout.wr()),
+                        Err: IOStream::Fd(pipes.stderr.wr()),
+                    });
                     exec_oci_runtime_or_die();
                 }
                 Ok(ForkResult::Parent { .. }) => {
