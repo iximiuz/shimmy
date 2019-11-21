@@ -45,10 +45,25 @@ pub enum IOStream {
     Fd(RawFd),
 }
 
+#[allow(non_snake_case)]
 pub struct IOStreams {
     pub In: IOStream,
     pub Out: IOStream,
     pub Err: IOStream,
+}
+
+impl IOStreams {
+    pub fn close_all(&self) {
+        if let IOStream::Fd(fd) = self.In {
+            close(fd).expect("close(STDIN) failed");
+        }
+        if let IOStream::Fd(fd) = self.Out {
+            close(fd).expect("close(STDOUT) failed");
+        }
+        if let IOStream::Fd(fd) = self.Err {
+            close(fd).expect("close(STDERR) failed");
+        }
+    }
 }
 
 pub fn set_stdio(streams: IOStreams) {

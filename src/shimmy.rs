@@ -6,13 +6,15 @@ use std::str;
 
 use libc::_exit;
 use nix::sys::signal::Signal::{SIGINT, SIGKILL, SIGQUIT, SIGTERM};
-use nix::unistd::{close, execv, fork, read, ForkResult, Pid};
+use nix::unistd::{execv, fork, read, ForkResult, Pid};
 
 mod nixtools;
 use nixtools::{
-    create_pipe, session_start, set_child_subreaper, set_parent_death_signal, set_stdio,
-    signals_block, signals_restore, Pipe, IOStream, IOStreams,
+    session_start, set_child_subreaper, set_parent_death_signal, set_stdio, signals_block,
+    signals_restore, IOStream, IOStreams,
 };
+mod stdiotools;
+use stdiotools::StdioPipes;
 
 fn main() {
     // Main process
@@ -25,7 +27,7 @@ fn main() {
         }
         Ok(ForkResult::Child) => {
             // Shim process
-            set_stdio(IOStreams{
+            set_stdio(IOStreams {
                 In: IOStream::DevNull,
                 Out: IOStream::DevNull,
                 Err: IOStream::DevNull,
@@ -33,7 +35,7 @@ fn main() {
             session_start();
             set_child_subreaper();
 
-            let pipes = create_runtime_stdio_pipes();
+            let iopipes = StdioPipes::new();
             let oldmask = signals_block(&[SIGINT, SIGQUIT, SIGTERM]);
 
             match fork() {
@@ -42,16 +44,15 @@ fn main() {
                     // TODO: check does it still work after exec)
                     set_parent_death_signal(SIGKILL);
                     signals_restore(&oldmask);
-                    set_stdio(IOStreams{
-                        In: IOStream::DevNull,
-                        Out: IOStream::Fd(pipes.stdout.wr()),
-                        Err: IOStream::Fd(pipes.stderr.wr()),
-                    });
+                    set_stdio(iopipes.slave);
                     exec_oci_runtime_or_die();
                 }
                 Ok(ForkResult::Parent { .. }) => {
                     // Shim process
-                    start_shim_server(pipes);
+                    // TODO: set exit signal handlers before restoring the mask
+                    signals_restore(&oldmask);
+                    iopipes.slave.close_all();
+                    start_shim_server(iopipes.master);
                 }
                 Err(err) => {
                     panic!("fork() of the container runtime process failed: {}", err);
@@ -64,37 +65,26 @@ fn main() {
     };
 }
 
-struct Pipes {
-    stdout: Pipe,
-    stderr: Pipe,
-}
-
-fn create_runtime_stdio_pipes() -> Pipes {
-    Pipes {
-        stdout: create_pipe(),
-        stderr: create_pipe(),
+fn start_shim_server(runtime_stdio: IOStreams) {
+    if let IOStream::Fd(fd) = runtime_stdio.Err {
+        let mut buf = vec![0; 1024];
+        let nread = read(fd, buf.as_mut_slice()).unwrap();
+        println!(
+            "[server] read (STDERR) {} bytes: [{}]",
+            nread,
+            str::from_utf8(&buf).unwrap()
+        );
     }
-}
 
-fn start_shim_server(runtime_stdio: Pipes) {
-    close(runtime_stdio.stdout.wr()).expect("close(pw) failed");
-    close(runtime_stdio.stderr.wr()).expect("close(pw) failed");
-
-    let mut buf = vec![0; 1024];
-    let nread = read(runtime_stdio.stderr.rd(), buf.as_mut_slice()).unwrap();
-    println!(
-        "[server] read (STDERR) {} bytes: [{}]",
-        nread,
-        str::from_utf8(&buf).unwrap()
-    );
-
-    let mut buf2 = vec![0; 1024];
-    let nread = read(runtime_stdio.stdout.rd(), buf2.as_mut_slice()).unwrap();
-    println!(
-        "[server] read (STDOUT) {} bytes: [{}]",
-        nread,
-        str::from_utf8(&buf2).unwrap()
-    );
+    if let IOStream::Fd(fd) = runtime_stdio.Out {
+        let mut buf = vec![0; 1024];
+        let nread = read(fd, buf.as_mut_slice()).unwrap();
+        println!(
+            "[server] read (STDOUT) {} bytes: [{}]",
+            nread,
+            str::from_utf8(&buf).unwrap()
+        );
+    }
 
     // run server
     //   read from stdout/stderr & dump to log
