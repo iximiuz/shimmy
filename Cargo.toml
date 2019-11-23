@@ -3,16 +3,17 @@ name = "shimmy"
 version = "0.1.0"
 authors = ["Ivan Velichko <iximiuz@gmail.com>"]
 edition = "2018"
+default-run = "shimmy"
 
 [dependencies]
 libc = "0.2"
 nix = "0.15.0"
 
 [[bin]]
-name = "shimmy"
-path = "src/shimmy.rs"
+name = "pipe"
+path = "src/playground/pipe.rs"
 
 [[bin]]
-name = "pipe"
-path = "src/pipe.rs"
+name = "signalfd"
+path = "src/playground/signalfd.rs"
 

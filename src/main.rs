@@ -8,13 +8,11 @@ use libc::_exit;
 use nix::sys::signal::Signal::{SIGINT, SIGKILL, SIGQUIT, SIGTERM};
 use nix::unistd::{execv, fork, read, ForkResult, Pid};
 
-mod nixtools;
-use nixtools::{
+use shimmy::nixtools::{
     session_start, set_child_subreaper, set_parent_death_signal, set_stdio, signals_block,
     signals_restore, IOStream, IOStreams,
 };
-mod stdiotools;
-use stdiotools::StdioPipes;
+use shimmy::stdiotools::StdioPipes;
 
 fn main() {
     // Main process
