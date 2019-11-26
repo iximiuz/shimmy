@@ -30,7 +30,7 @@ fn main() {
     // TODO: parse args
 
     match fork() {
-        Ok(ForkResult::Parent { child, .. }) => {
+        Ok(ForkResult::Parent { child }) => {
             // Main process (cont.)
             write_pid_file_and_exit("/home/vagrant/shimmy/pidfile.pid", child);
         }
@@ -51,7 +51,7 @@ fn main() {
     let oldmask = signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
 
     let runtime_pid = match fork() {
-        Ok(ForkResult::Parent { child, .. }) => child, 
+        Ok(ForkResult::Parent { child }) => child, 
         Ok(ForkResult::Child) => {
             // Container runtime process
             // TODO: check does it still work after exec)
@@ -71,9 +71,9 @@ fn main() {
 
 struct State {
     runtime_pid: Pid,
-    runtime_status: Option<i32>,
+    runtime_status: Option<WaitStatus>,
     container_pid: Option<Pid>,
-    container_status: Option<i32>,
+    container_status: Option<WaitStatus>,
     inflight_signal: Option<i32>,
 }
 
@@ -90,28 +90,7 @@ impl State {
 }
 
 fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
-    // create signalfd and start reading
-    // wait for sigchld
-    //
-    // let sig = read(sfd)
-    // if sig in (SIGINT, SIGQUIT, SIGTERM):
-    //     if runtime_pid:
-    //         kill(runtime_pid, sig)
-    //     if container_pid:
-    //         kill(container_pid, sig)
-    //
-    // if sig == SIGCHLD:
-    //    let pid1 = waitpid(-1, &status, WNOHANG);
-    //    if pid1 == runtime_pid:
-    //        if status == 0:
-    //            runtime_pid = 0
-    //        else:
-    //            do a cleanup, report back to the parent, exit
-    //
-    //    if pid1 != runtime_pid:
-    //        container_pid = pid
-
-    let state = State::new(runtime_pid);
+    let mut state = State::new(runtime_pid);
 
     let mut sigmask = SigSet::empty();
     sigmask.add(SIGCHLD);
@@ -119,24 +98,39 @@ fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
     sigmask.add(SIGQUIT);
     sigmask.add(SIGTERM);
     let mut sfd = SignalFd::new(&sigmask).unwrap();
-    match sfd.read_signal() {
-        Ok(Some(sig)) => {
-            debug!("got signal {:?}", sig);
-            if sig.ssi_signo == SIGCHLD as u32 {
-                let (pid, exit_code) = wait_child().unwrap();
-                debug!("something exited PID={}, exit_code={}", pid, exit_code);
-                
-                while let Some((pid, exit_code)) = wait_child() {
-                    debug!("fuck this shit PID={}, exit_code={}", pid, exit_code);
+    while state.runtime_status.is_none() {
+        match sfd.read_signal() {
+            Ok(Some(sig)) => {
+                debug!("got signal {:?}", sig);
+                if sig.ssi_signo == SIGCHLD as u32 {
+                    let (pid, status) = check_child_status().expect("at least one child changed status");
+                    if pid == state.runtime_pid {
+                        state.runtime_status = Some(status);
+                        break;
+                    } else {
+                        state.container_pid = Some(pid);
+                        state.container_status = Some(status);
+                    }
+
+                    while let Some((pid, status)) = check_child_status() {
+                        if pid == state.runtime_pid {
+                            assert!(state.runtime_status.is_none());
+                            state.runtime_status = Some(status);
+                        } else {
+                            assert!(state.container_pid.is_none());
+                            state.container_pid = Some(pid);
+                            state.container_status = Some(status);
+                        }
+                    }
+                } else {
+                    // SIGINT, SIGQUIT, SIGTERM
+                    // state.inflight_signal = Some(sig.ssi_signo);
                 }
-            } else {
-                // SIGINT, SIGQUIT, SIGTERM
-                // state.inflight_signal = Some(sig.ssi_signo);
             }
-        }
-        Ok(None) => panic!("wtf? We are in blocking mode"),
-        Err(err) => panic!("read(signalfd) failed {}", err),
-    };
+            Ok(None) => panic!("wtf? We are in blocking mode"),
+            Err(err) => panic!("read(signalfd) failed {}", err),
+        };
+    }
 
     // TODO:
     // waitpid(runtime_pid)
@@ -168,27 +162,24 @@ fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
     }
 }
 
-fn wait_child() -> Option<(Pid, i32)> {
-    match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::Exited(pid, exit_code)) => {
-            return Some((pid, exit_code));
-        }
-        Ok(WaitStatus::StillAlive) => {
-            return None;
-        }
-        Ok(res) => {
-            panic!("waitpid() returned unexpected result {:?}", res);
-        }
+fn check_child_status() -> Option<(Pid, WaitStatus)> {
+    let status = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
+    match status {
+        Ok(WaitStatus::Exited(pid, ..)) => Some((pid, status.unwrap())),
+        
+        Ok(WaitStatus::Signaled(pid, ..)) => Some((pid, status.unwrap())),
+
+        Ok(_) => None,  // non-terminal signals
+
         Err(nix::Error::Sys(errno)) => {
-            if errno as libc::c_int != libc::ECHILD {
-                panic!("waitpid() returned unexpected error {:?}", errno);
+            if errno as libc::c_int == libc::ECHILD {
+                return None;  // no children left
             }
-            return None;
+            panic!("waitpid() failed with errno {:?}", errno);
         }
-        Err(err) => {
-            panic!("waitpid() failed {:?}", err);
-        }
-    };
+
+        Err(err) => panic!("waitpid() failed with error {:?}", err),
+    }
 }
 
 fn write_pid_file_and_exit<P: AsRef<Path>>(filename: P, pid: Pid) {
