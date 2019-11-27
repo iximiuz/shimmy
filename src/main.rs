@@ -103,16 +103,7 @@ fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
             Ok(Some(sig)) => {
                 debug!("got signal {:?}", sig);
                 if sig.ssi_signo == SIGCHLD as u32 {
-                    let (pid, status) = check_child_status().expect("at least one child changed status");
-                    if pid == state.runtime_pid {
-                        state.runtime_status = Some(status);
-                        break;
-                    } else {
-                        state.container_pid = Some(pid);
-                        state.container_status = Some(status);
-                    }
-
-                    while let Some((pid, status)) = check_child_status() {
+                    while let Some((pid, status)) = query_child_termination() {
                         if pid == state.runtime_pid {
                             assert!(state.runtime_status.is_none());
                             state.runtime_status = Some(status);
@@ -162,7 +153,7 @@ fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
     }
 }
 
-fn check_child_status() -> Option<(Pid, WaitStatus)> {
+fn query_child_termination() -> Option<(Pid, WaitStatus)> {
     let status = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
     match status {
         Ok(WaitStatus::Exited(pid, ..)) => Some((pid, status.unwrap())),
