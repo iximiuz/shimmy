@@ -9,12 +9,13 @@ extern crate syslog;
 extern crate log;
 
 use libc::_exit;
-use nix::sys::signal::SigSet;
+use nix::errno::Errno;
 use nix::sys::signal::Signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
+use nix::sys::signal::{kill, SigSet, Signal};
 use nix::sys::signalfd::*;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execv, fork, read, ForkResult, Pid};
-use syslog::{Facility, Formatter3164, BasicLogger};
+use syslog::{BasicLogger, Facility, Formatter3164};
 
 use shimmy::nixtools::{
     session_start, set_child_subreaper, set_parent_death_signal, set_stdio, signals_block,
@@ -51,7 +52,7 @@ fn main() {
     let oldmask = signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
 
     let runtime_pid = match fork() {
-        Ok(ForkResult::Parent { child }) => child, 
+        Ok(ForkResult::Parent { child }) => child,
         Ok(ForkResult::Child) => {
             // Container runtime process
             // TODO: check does it still work after exec)
@@ -74,7 +75,7 @@ struct State {
     runtime_status: Option<WaitStatus>,
     container_pid: Option<Pid>,
     container_status: Option<WaitStatus>,
-    inflight_signal: Option<i32>,
+    inflight_signal: Option<Signal>,
 }
 
 impl State {
@@ -84,7 +85,7 @@ impl State {
             runtime_status: None,
             container_pid: None,
             container_status: None,
-            inflight_signal: None
+            inflight_signal: None,
         }
     }
 }
@@ -100,22 +101,36 @@ fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
     let mut sfd = SignalFd::new(&sigmask).unwrap();
     while state.runtime_status.is_none() {
         match sfd.read_signal() {
-            Ok(Some(sig)) => {
-                debug!("got signal {:?}", sig);
-                if sig.ssi_signo == SIGCHLD as u32 {
-                    while let Some((pid, status)) = query_child_termination() {
-                        if pid == state.runtime_pid {
-                            assert!(state.runtime_status.is_none());
-                            state.runtime_status = Some(status);
-                        } else {
-                            assert!(state.container_pid.is_none());
-                            state.container_pid = Some(pid);
-                            state.container_status = Some(status);
+            Ok(Some(sinfo)) => {
+                debug!("got signal {:?}", sinfo);
+
+                match Signal::from_c_int(sinfo.ssi_signo as libc::c_int) {
+                    Ok(SIGCHLD) => {
+                        while let Some((pid, status)) = query_child_termination() {
+                            if pid == state.runtime_pid {
+                                assert!(state.runtime_status.is_none());
+                                state.runtime_status = Some(status);
+                            } else {
+                                assert!(state.container_pid.is_none());
+                                state.container_pid = Some(pid);
+                                state.container_status = Some(status);
+                            }
                         }
                     }
-                } else {
-                    // SIGINT, SIGQUIT, SIGTERM
-                    // state.inflight_signal = Some(sig.ssi_signo);
+
+                    Ok(sig) if [SIGINT, SIGQUIT, SIGTERM].contains(&sig) => {
+                        match kill(runtime_pid, sig) {
+                            Ok(_) => (),
+                            Err(nix::Error::Sys(Errno::ESRCH)) => {
+                                // runtime already has exited, keep the signal
+                                // to send it to the container once we know its PID.
+                                state.inflight_signal = Some(sig);
+                            }
+                            Err(err) => panic!("kill(runtime_pid) failed: {:?}", err),
+                        }
+                    }
+
+                    _ => panic!("unexpected signal received {:?}", sinfo),
                 }
             }
             Ok(None) => panic!("wtf? We are in blocking mode"),
@@ -124,11 +139,10 @@ fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
     }
 
     // TODO:
-    // waitpid(runtime_pid)
     // if runtime exit code != 0 report error (using ENV[SYNC_FD]) and exit
     // read container pid file (runc was supposed to store it on disk before exiting)
     // report container pid back to the parent (using ENV[SYNC_FD])
-    // waitpid(container pid)
+    // if have an inflight_signal, send it to container
     // set up container execution timeout if needed
     // mio->run();
     // report container exit code to the parent (using ENV[SYNC_FD])
@@ -157,17 +171,12 @@ fn query_child_termination() -> Option<(Pid, WaitStatus)> {
     let status = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
     match status {
         Ok(WaitStatus::Exited(pid, ..)) => Some((pid, status.unwrap())),
-        
+
         Ok(WaitStatus::Signaled(pid, ..)) => Some((pid, status.unwrap())),
 
-        Ok(_) => None,  // non-terminal signals
+        Ok(_) => None, // non-terminal signals
 
-        Err(nix::Error::Sys(errno)) => {
-            if errno as libc::c_int == libc::ECHILD {
-                return None;  // no children left
-            }
-            panic!("waitpid() failed with errno {:?}", errno);
-        }
+        Err(nix::Error::Sys(Errno::ECHILD)) => None, // no children left
 
         Err(err) => panic!("waitpid() failed with error {:?}", err),
     }
@@ -205,5 +214,6 @@ fn setup_logger() {
 
     let logger = syslog::unix(formatter).expect("could not connect to syslog");
     log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-            .map(|()| log::set_max_level(log::LevelFilter::Debug)).expect("log::set_boxed_logger() failed");
+        .map(|()| log::set_max_level(log::LevelFilter::Debug))
+        .expect("log::set_boxed_logger() failed");
 }
