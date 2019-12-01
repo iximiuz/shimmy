@@ -2,26 +2,21 @@ use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::process::exit;
-use std::str;
 
 extern crate syslog;
 #[macro_use]
 extern crate log;
 
 use libc::_exit;
-use nix::errno::Errno;
+use nix::sys::signal::Signal;
 use nix::sys::signal::Signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
-use nix::sys::signal::{kill, SigSet, Signal};
-use nix::sys::signalfd::*;
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{execv, fork, read, ForkResult, Pid};
+use nix::unistd::{execv, fork, ForkResult, Pid};
 use syslog::{BasicLogger, Facility, Formatter3164};
 
-use shimmy::nixtools::{
-    session_start, set_child_subreaper, set_parent_death_signal, set_stdio, signals_block,
-    signals_restore, IOStream, IOStreams,
-};
-use shimmy::stdiotools::StdioPipes;
+use shimmy::nixtools::kill::{get_child_termination_status, kill, KillResult, TerminationStatus};
+use shimmy::nixtools::misc::{session_start, set_child_subreaper, set_parent_death_signal};
+use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
+use shimmy::nixtools::stdio::{set_stdio, IOStream, IOStreams, StdioPipes};
 
 fn main() {
     // Main process
@@ -67,77 +62,25 @@ fn main() {
 
     // Shim process (cont.)
     iopipes.slave.close_all();
-    shim_server_run(runtime_pid, iopipes.master);
-}
 
-struct State {
-    runtime_pid: Pid,
-    runtime_status: Option<WaitStatus>,
-    container_pid: Option<Pid>,
-    container_status: Option<WaitStatus>,
-    inflight_signal: Option<Signal>,
-}
+    let mut sfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
+    match await_runtime_termination(&mut sfd, runtime_pid) {
+        RuntimeTermination::Normal { inflight } => {
+            shim_server_run(sfd, iopipes.master, inflight);
+        }
 
-impl State {
-    fn new(runtime_pid: Pid) -> Self {
-        Self {
-            runtime_pid: runtime_pid,
-            runtime_status: None,
-            container_pid: None,
-            container_status: None,
-            inflight_signal: None,
+        RuntimeTermination::NormalWithContainer { container } => {
+            // finalize_and_clean_up();
+        }
+
+        RuntimeTermination::Abnormal { runtime } => {
+            // read runtime.stderr and send it back to syncfd, then exit.
+            panic!();
         }
     }
 }
 
-fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
-    let mut state = State::new(runtime_pid);
-
-    let mut sigmask = SigSet::empty();
-    sigmask.add(SIGCHLD);
-    sigmask.add(SIGINT);
-    sigmask.add(SIGQUIT);
-    sigmask.add(SIGTERM);
-    let mut sfd = SignalFd::new(&sigmask).unwrap();
-    while state.runtime_status.is_none() {
-        match sfd.read_signal() {
-            Ok(Some(sinfo)) => {
-                debug!("got signal {:?}", sinfo);
-
-                match Signal::from_c_int(sinfo.ssi_signo as libc::c_int) {
-                    Ok(SIGCHLD) => {
-                        while let Some((pid, status)) = query_child_termination() {
-                            if pid == state.runtime_pid {
-                                assert!(state.runtime_status.is_none());
-                                state.runtime_status = Some(status);
-                            } else {
-                                assert!(state.container_pid.is_none());
-                                state.container_pid = Some(pid);
-                                state.container_status = Some(status);
-                            }
-                        }
-                    }
-
-                    Ok(sig) if [SIGINT, SIGQUIT, SIGTERM].contains(&sig) => {
-                        match kill(runtime_pid, sig) {
-                            Ok(_) => (),
-                            Err(nix::Error::Sys(Errno::ESRCH)) => {
-                                // runtime already has exited, keep the signal
-                                // to send it to the container once we know its PID.
-                                state.inflight_signal = Some(sig);
-                            }
-                            Err(err) => panic!("kill(runtime_pid) failed: {:?}", err),
-                        }
-                    }
-
-                    _ => panic!("unexpected signal received {:?}", sinfo),
-                }
-            }
-            Ok(None) => panic!("wtf? We are in blocking mode"),
-            Err(err) => panic!("read(signalfd) failed {}", err),
-        };
-    }
-
+fn shim_server_run(sfd: Signalfd, container_stdio: IOStreams, inflight_signal: Option<Signal>) {
     // TODO:
     // if runtime exit code != 0 report error (using ENV[SYNC_FD]) and exit
     // read container pid file (runc was supposed to store it on disk before exiting)
@@ -146,39 +89,122 @@ fn shim_server_run(runtime_pid: Pid, runtime_stdio: IOStreams) {
     // set up container execution timeout if needed
     // mio->run();
     // report container exit code to the parent (using ENV[SYNC_FD])
-    if let IOStream::Fd(fd) = runtime_stdio.Err {
-        let mut buf = vec![0; 1024];
-        let nread = read(fd, buf.as_mut_slice()).unwrap();
-        debug!(
-            "[server] read (STDERR) {} bytes: [{}]",
-            nread,
-            str::from_utf8(&buf).unwrap()
-        );
-    }
+    // if let IOStream::Fd(fd) = runtime_stdio.Err {
+    //     let mut buf = vec![0; 1024];
+    //     let nread = read(fd, buf.as_mut_slice()).unwrap();
+    //     debug!(
+    //         "[server] read (STDERR) {} bytes: [{}]",
+    //         nread,
+    //         str::from_utf8(&buf).unwrap()
+    //     );
+    // }
 
-    if let IOStream::Fd(fd) = runtime_stdio.Out {
-        let mut buf = vec![0; 1024];
-        let nread = read(fd, buf.as_mut_slice()).unwrap();
-        debug!(
-            "[server] read (STDOUT) {} bytes: [{}]",
-            nread,
-            str::from_utf8(&buf).unwrap()
-        );
+    // if let IOStream::Fd(fd) = runtime_stdio.Out {
+    //     let mut buf = vec![0; 1024];
+    //     let nread = read(fd, buf.as_mut_slice()).unwrap();
+    //     debug!(
+    //         "[server] read (STDOUT) {} bytes: [{}]",
+    //         nread,
+    //         str::from_utf8(&buf).unwrap()
+    //     );
+    // }
+}
+
+enum RuntimeTermination {
+    Normal { inflight: Option<Signal> },
+    NormalWithContainer { container: TerminationStatus },
+    Abnormal { runtime: TerminationStatus },
+}
+
+fn await_runtime_termination(sfd: &mut Signalfd, runtime_pid: Pid) -> RuntimeTermination {
+    let mut container: Option<TerminationStatus> = None;
+    let mut inflight: Option<Signal> = None;
+    loop {
+        match sfd.read_signal() {
+            SIGCHLD => {
+                debug!("SIGCHLD received, querying runtime status.");
+
+                match get_termination_statuses(runtime_pid) {
+                    (Some(rt), ct) => {
+                        assert!(
+                            ct.is_none() || container.is_none(),
+                            "ambiguous container termination status"
+                        );
+                        return dispatch_runtime_termination(rt, container.or(ct), inflight);
+                    }
+
+                    (None, Some(ct)) => {
+                        assert!(
+                            container.is_none(),
+                            "ambiguous container termination status"
+                        );
+                        container = Some(ct); // Keep it for later use.
+                    }
+
+                    (None, None) => (), // Continue...
+                }
+            }
+
+            sig if [SIGINT, SIGQUIT, SIGTERM].contains(&sig) => {
+                debug!("{} received, propagating to runtime.", sig);
+
+                match kill(runtime_pid, sig) {
+                    Ok(KillResult::Delivered) => (), // Keep waiting for runtime termination...
+
+                    Ok(KillResult::ProcessNotFound) => {
+                        // Runtime already has exited, keep the signal
+                        // to send it to the container once we know its PID.
+                        inflight = Some(sig);
+                    }
+
+                    Err(err) => panic!("kill(runtime_pid, {}) failed: {:?}", sig, err),
+                }
+            }
+            sig => panic!("unexpected signal received {:?}", sig),
+        };
     }
 }
 
-fn query_child_termination() -> Option<(Pid, WaitStatus)> {
-    let status = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
-    match status {
-        Ok(WaitStatus::Exited(pid, ..)) => Some((pid, status.unwrap())),
+fn get_termination_statuses(
+    runtime_pid: Pid,
+) -> (Option<TerminationStatus>, Option<TerminationStatus>) {
+    let mut runtime: Option<TerminationStatus> = None;
+    let mut container: Option<TerminationStatus> = None;
 
-        Ok(WaitStatus::Signaled(pid, ..)) => Some((pid, status.unwrap())),
+    while let Some(status) = get_child_termination_status() {
+        if status.pid() == runtime_pid {
+            assert!(runtime.is_none());
+            runtime = Some(status);
+        } else {
+            assert!(container.is_none());
+            container = Some(status);
+        }
+    }
 
-        Ok(_) => None, // non-terminal signals
+    (runtime, container)
+}
 
-        Err(nix::Error::Sys(Errno::ECHILD)) => None, // no children left
+fn dispatch_runtime_termination(
+    runtime: TerminationStatus,
+    container: Option<TerminationStatus>,
+    inflight: Option<Signal>,
+) -> RuntimeTermination {
+    if runtime.exited_with_code(0) {
+        match container {
+            None => RuntimeTermination::Normal { inflight },
 
-        Err(err) => panic!("waitpid() failed with error {:?}", err),
+            Some(container) => {
+                if let Some(sig) = inflight {
+                    warn!(
+                        "{} received but both runtime and container have been already terminated",
+                        sig
+                    );
+                }
+                RuntimeTermination::NormalWithContainer { container }
+            }
+        }
+    } else {
+        RuntimeTermination::Abnormal { runtime }
     }
 }
 
