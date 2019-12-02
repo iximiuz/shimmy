@@ -12,8 +12,12 @@ nix = "0.15.0"
 syslog = "5.0.0"
 
 [[bin]]
-name = "pipe"
-path = "src/playground/pipe.rs"
+name = "pipe1"
+path = "src/playground/pipe1.rs"
+
+[[bin]]
+name = "pipe2"
+path = "src/playground/pipe2.rs"
 
 [[bin]]
 name = "signalfd"

@@ -14,9 +14,12 @@ use nix::unistd::{execv, fork, ForkResult, Pid};
 use syslog::{BasicLogger, Facility, Formatter3164};
 
 use shimmy::nixtools::kill::{get_child_termination_status, kill, KillResult, TerminationStatus};
-use shimmy::nixtools::misc::{session_start, set_child_subreaper, set_parent_death_signal};
+use shimmy::nixtools::misc::{
+    get_pipe_fd_from_env, session_start, set_child_subreaper, set_parent_death_signal,
+};
 use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
 use shimmy::nixtools::stdio::{set_stdio, IOStream, IOStreams, StdioPipes};
+use shimmy::syncpipe::SyncPipe;
 
 fn main() {
     // Main process
@@ -42,9 +45,8 @@ fn main() {
     });
     session_start();
     set_child_subreaper();
-
-    let iopipes = StdioPipes::new();
     let oldmask = signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
+    let iopipes = StdioPipes::new();
 
     let runtime_pid = match fork() {
         Ok(ForkResult::Parent { child }) => child,
@@ -63,28 +65,37 @@ fn main() {
     // Shim process (cont.)
     iopipes.slave.close_all();
 
-    let mut sfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
-    match await_runtime_termination(&mut sfd, runtime_pid) {
+    run_shim(runtime_pid, iopipes.master);
+    info!("shimmy says bye!");
+}
+
+fn run_shim(runtime_pid: Pid, runtime_stdio: IOStreams) {
+    let mut sigfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
+    let mut syncpipe = SyncPipe::new(get_pipe_fd_from_env("_OCI_SYNCPIPE"));
+
+    match await_runtime_termination(&mut sigfd, runtime_pid) {
         RuntimeTermination::Normal { inflight } => {
-            shim_server_run(sfd, iopipes.master, inflight);
+            // syncfd.report_container_pid();
+            shim_server_run(sigfd, runtime_stdio, inflight);
+            // drain master stdio
         }
 
         RuntimeTermination::NormalWithContainer { container } => {
-            // finalize_and_clean_up();
+            // syncfd.report_container_pid();
+            // drain master stdio
         }
 
         RuntimeTermination::Abnormal { runtime } => {
-            // read runtime.stderr and send it back to syncfd, then exit.
-            panic!();
+            syncpipe.write_abnormal_runtime_termination(runtime, &runtime_stdio.Err.read_all());
         }
     }
 }
 
-fn shim_server_run(sfd: Signalfd, container_stdio: IOStreams, inflight_signal: Option<Signal>) {
+fn shim_server_run(sigfd: Signalfd, container_stdio: IOStreams, inflight_signal: Option<Signal>) {
     // TODO:
-    // if runtime exit code != 0 report error (using ENV[SYNC_FD]) and exit
     // read container pid file (runc was supposed to store it on disk before exiting)
     // report container pid back to the parent (using ENV[SYNC_FD])
+
     // if have an inflight_signal, send it to container
     // set up container execution timeout if needed
     // mio->run();
@@ -116,11 +127,11 @@ enum RuntimeTermination {
     Abnormal { runtime: TerminationStatus },
 }
 
-fn await_runtime_termination(sfd: &mut Signalfd, runtime_pid: Pid) -> RuntimeTermination {
+fn await_runtime_termination(sigfd: &mut Signalfd, runtime_pid: Pid) -> RuntimeTermination {
     let mut container: Option<TerminationStatus> = None;
     let mut inflight: Option<Signal> = None;
     loop {
-        match sfd.read_signal() {
+        match sigfd.read_signal() {
             SIGCHLD => {
                 debug!("SIGCHLD received, querying runtime status.");
 

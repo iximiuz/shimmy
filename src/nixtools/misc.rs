@@ -1,8 +1,24 @@
+use std::env;
+use std::os::unix::io::RawFd;
+
 use libc::{self, c_int, c_ulong};
 use nix::errno::Errno;
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::signal::Signal;
 use nix::unistd::setsid;
 use nix::Result;
+
+pub fn get_pipe_fd_from_env(name: &str) -> RawFd {
+    let str_fd = env::var(name).expect("failed to get pipe fd from ENV");
+    let fd = str_fd.parse::<c_int>().expect("ENV fd is not a number");
+
+    match fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)) {
+        Ok(rv) if rv != -1 => (),
+        _ => panic!("fcntl(F_SETFD, FD_CLOEXEC"),
+    }
+
+    return fd;
+}
 
 pub fn session_start() {
     setsid().expect("sessid() failed");

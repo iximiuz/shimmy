@@ -1,4 +1,7 @@
-use std::os::unix::io::RawFd;
+use std::fs::File;
+use std::io::Read;
+use std::mem;
+use std::os::unix::io::{FromRawFd, RawFd};
 
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
@@ -9,6 +12,18 @@ use crate::nixtools::pipe::Pipe;
 pub enum IOStream {
     DevNull,
     Fd(RawFd),
+}
+
+impl IOStream {
+    pub fn read_all(self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if let Self::Fd(fd) = self {
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            file.read_to_end(&mut bytes).expect("read_to_end() failed");
+            mem::forget(file); // omit the destruciton of the file, i.e. no call to close(fd).
+        }
+        bytes
+    }
 }
 
 #[allow(non_snake_case)]
