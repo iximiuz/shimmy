@@ -3,11 +3,8 @@ use std::fs;
 use std::path::Path;
 use std::process::exit;
 
-extern crate syslog;
-#[macro_use]
-extern crate log;
-
 use libc::_exit;
+use log::{debug, info, warn};
 use nix::sys::signal::Signal;
 use nix::sys::signal::Signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
 use nix::unistd::{execv, fork, ForkResult, Pid};
@@ -75,17 +72,23 @@ fn run_shim(runtime_pid: Pid, runtime_stdio: IOStreams) {
 
     match await_runtime_termination(&mut sigfd, runtime_pid) {
         RuntimeTermination::Normal { inflight } => {
+            debug!("runtime terminated normally");
             // syncfd.report_container_pid();
             shim_server_run(sigfd, runtime_stdio, inflight);
             // drain master stdio
         }
 
         RuntimeTermination::NormalWithContainer { container } => {
+            debug!(
+                "runtime terminated normally, container terminated with status: {}",
+                container
+            );
             // syncfd.report_container_pid();
             // drain master stdio
         }
 
         RuntimeTermination::Abnormal { runtime } => {
+            debug!("runtime terminated abnormally: {}", runtime);
             syncpipe.write_abnormal_runtime_termination(runtime, &runtime_stdio.Err.read_all());
         }
     }
@@ -232,7 +235,8 @@ fn write_pid_file_and_exit<P: AsRef<Path>>(filename: P, pid: Pid) {
 
 fn exec_oci_runtime_or_exit() {
     let name = CString::new("/usr/bin/runc").unwrap();
-    if let Err(err) = execv(&name, &vec![name.clone()]) {
+    let arg1 = CString::new("-foobar").unwrap();
+    if let Err(err) = execv(&name, &vec![name.clone(), arg1]) {
         panic!("execv() failed: {}", err);
     }
 

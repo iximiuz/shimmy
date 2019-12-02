@@ -1,3 +1,5 @@
+use std::fmt;
+
 use nix::errno::Errno;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -5,9 +7,16 @@ use nix::unistd::Pid;
 
 type ExitCode = i32;
 
+#[derive(Debug)]
 pub enum TerminationStatus {
     Exited(Pid, ExitCode),
     Signaled(Pid, Signal),
+}
+
+impl fmt::Display for TerminationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 impl TerminationStatus {
