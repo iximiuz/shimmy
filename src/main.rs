@@ -13,10 +13,10 @@ use syslog::{BasicLogger, Facility, Formatter3164};
 use shimmy::nixtools::misc::{
     get_pipe_fd_from_env, session_start, set_child_subreaper, set_parent_death_signal,
 };
-use shimmy::nixtools::process::TerminationStatus::Exited;
+use shimmy::nixtools::process::{kill, KillResult, TerminationStatus as ProcessTerminationStatus};
 use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
 use shimmy::nixtools::stdio::{set_stdio, IOStream, IOStreams, StdioPipes};
-use shimmy::runtime::{await_runtime_termination, TerminationStatus};
+use shimmy::runtime::{await_runtime_termination, TerminationStatus as RuntimeTerminationStatus};
 use shimmy::syncpipe::SyncPipe;
 
 fn main() {
@@ -29,7 +29,7 @@ fn main() {
     match fork() {
         Ok(ForkResult::Parent { child }) => {
             // Main process (cont.)
-            write_pid_file_and_exit("/home/vagrant/shimmy/pidfile.pid", child);
+            write_runtime_pidfile_and_exit("/home/vagrant/shimmy/runtime_pidfile.pid", child);
         }
         Ok(ForkResult::Child) => (), // Shim process
         Err(err) => panic!("fork() of the shim process failed: {}", err),
@@ -68,64 +68,68 @@ fn main() {
 }
 
 fn run_shim(runtime_pid: Pid, runtime_stdio: IOStreams) {
+    use ProcessTerminationStatus::Exited;
+
     let mut sigfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
     let mut syncpipe = SyncPipe::new(get_pipe_fd_from_env("_OCI_SYNCPIPE"));
 
     match await_runtime_termination(&mut sigfd, runtime_pid) {
-        TerminationStatus::Solitary(Exited(.., 0), inflight) => {
+        RuntimeTerminationStatus::Solitary(Exited(.., 0), inflight) => {
             debug!("runtime terminated normally");
-            // syncfd.report_container_pid();
-            shim_server_run(sigfd, runtime_stdio, inflight);
-            // drain master stdio
+
+            let container_pid =
+                read_container_pidfile("/home/vagrant/shimmy/container_pidfile.pid");
+            syncpipe.report_container_pid(container_pid);
+
+            if let Some(sig) = inflight {
+                deliver_inflight_signal(container_pid, sig);
+            }
+
+            save_container_termination_status(serve_container(&mut sigfd, container_pid, runtime_stdio));
         }
 
-        ts @ TerminationStatus::Solitary(..) => {
+        ts @ RuntimeTerminationStatus::Solitary(..) => {
             warn!("runtime terminated abnormally: {}", ts);
             syncpipe.report_abnormal_runtime_termination(ts, &runtime_stdio.Err.read_all());
         }
 
-        ts @ TerminationStatus::Conjoint(..) => {
+        ts @ RuntimeTerminationStatus::Conjoint(..) => {
             warn!("runtime and container terminated unexpectedly: {}", ts);
             syncpipe.report_abnormal_runtime_termination(ts, &runtime_stdio.Err.read_all());
         }
     }
 }
 
-fn shim_server_run(
-    _sigfd: Signalfd,
-    _container_stdio: IOStreams,
-    _inflight_signal: Option<Signal>,
-) {
-    // TODO:
-    // read container pid file (runc was supposed to store it on disk before exiting)
-    // report container pid back to the parent (using ENV[SYNC_FD])
-
-    // if have an inflight_signal, send it to container
+fn serve_container(_sigfd: &mut Signalfd, container_pid: Pid, _container_stdio: IOStreams) -> ProcessTerminationStatus {
     // set up container execution timeout if needed
     // mio->run();
-    // report container exit code to the parent (using ENV[SYNC_FD])
-    // if let IOStream::Fd(fd) = runtime_stdio.Err {
-    //     let mut buf = vec![0; 1024];
-    //     let nread = read(fd, buf.as_mut_slice()).unwrap();
-    //     debug!(
-    //         "[server] read (STDERR) {} bytes: [{}]",
-    //         nread,
-    //         str::from_utf8(&buf).unwrap()
-    //     );
-    // }
-
-    // if let IOStream::Fd(fd) = runtime_stdio.Out {
-    //     let mut buf = vec![0; 1024];
-    //     let nread = read(fd, buf.as_mut_slice()).unwrap();
-    //     debug!(
-    //         "[server] read (STDOUT) {} bytes: [{}]",
-    //         nread,
-    //         str::from_utf8(&buf).unwrap()
-    //     );
-    // }
+    // drain master stdio
+    ProcessTerminationStatus::Exited(container_pid, 0)
 }
 
-fn write_pid_file_and_exit<P: AsRef<Path>>(filename: P, pid: Pid) {
+fn deliver_inflight_signal(container_pid: Pid, signal: Signal) {
+    match kill(container_pid, signal) {
+        Ok(KillResult::Delivered) => (),
+        Ok(KillResult::ProcessNotFound) => {
+            warn!("Failed to deliver inflight signal to container, probably exited")
+        }
+        Err(err) => warn!("Failed to deliver inflight signal to container: {}", err),
+    }
+}
+
+fn save_container_termination_status(_status: ProcessTerminationStatus) {
+}
+
+fn read_container_pidfile<P: AsRef<Path>>(filename: P) -> Pid {
+    let content = fs::read_to_string(&filename).expect("fs::read_to_string() failed");
+    return Pid::from_raw(
+        content
+            .parse::<i32>()
+            .expect("failed to parse container PID file"),
+    );
+}
+
+fn write_runtime_pidfile_and_exit<P: AsRef<Path>>(filename: P, pid: Pid) {
     if let Err(err) = fs::write(&filename, format!("{}", pid)) {
         panic!(
             "write() to pidfile {} failed: {}",
