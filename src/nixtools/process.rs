@@ -7,7 +7,7 @@ use nix::unistd::Pid;
 
 type ExitCode = i32;
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub enum TerminationStatus {
     Exited(Pid, ExitCode),
     Signaled(Pid, Signal),
@@ -15,7 +15,10 @@ pub enum TerminationStatus {
 
 impl fmt::Display for TerminationStatus {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            Self::Exited(.., code) => write!(f, "Exited with code {}", code),
+            Self::Signaled(.., sig) => write!(f, "Received signal {}", sig),
+        }
     }
 }
 
@@ -27,10 +30,10 @@ impl TerminationStatus {
         }
     }
 
-    pub fn exited_with_code(&self, expected: ExitCode) -> bool {
+    pub fn exit_code(&self) -> Option<ExitCode> {
         match self {
-            Self::Exited(.., code) if *code == expected => true,
-            _ => false,
+            Self::Exited(.., code) => Some(*code),
+            _ => None,
         }
     }
 }

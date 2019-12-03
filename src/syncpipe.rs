@@ -4,13 +4,13 @@ use std::os::unix::io::{FromRawFd, RawFd};
 
 use serde::Serialize;
 
-use crate::nixtools::kill::TerminationStatus;
+use crate::runtime::TerminationStatus;
 
 #[derive(Serialize)]
 struct MessageRuntimeAbnormalTermination {
     kind: &'static str,
     status: String,
-    stderr: Vec<u8>,
+    stderr: String,
 }
 
 impl MessageRuntimeAbnormalTermination {
@@ -18,7 +18,7 @@ impl MessageRuntimeAbnormalTermination {
         MessageRuntimeAbnormalTermination {
             kind: "runtime_abnormal_termination",
             status: format!("{}", status),
-            stderr: stderr.to_vec(),
+            stderr: String::from_utf8(stderr.to_vec()).unwrap_or(format!("{:?}", stderr)),
         }
     }
 }
@@ -30,9 +30,13 @@ impl SyncPipe {
         SyncPipe(unsafe { File::from_raw_fd(fd) })
     }
 
-    pub fn write_abnormal_runtime_termination(&mut self, status: TerminationStatus, stderr: &[u8]) {
-        let message = MessageRuntimeAbnormalTermination::new(status, stderr);
-        let encoded = serde_json::to_vec(&message).expect("JSON serialization failed");
-        self.0.write_all(&encoded).expect("SyncPipe.write() failed");
+    pub fn report_abnormal_runtime_termination(
+        &mut self,
+        status: TerminationStatus,
+        stderr: &[u8],
+    ) {
+        let msg = serde_json::to_vec(&MessageRuntimeAbnormalTermination::new(status, stderr))
+            .expect("JSON serialization failed");
+        self.0.write_all(&msg).expect("SyncPipe.write() failed");
     }
 }

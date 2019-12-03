@@ -10,12 +10,13 @@ use nix::sys::signal::Signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
 use nix::unistd::{execv, fork, ForkResult, Pid};
 use syslog::{BasicLogger, Facility, Formatter3164};
 
-use shimmy::nixtools::kill::{get_child_termination_status, kill, KillResult, TerminationStatus};
 use shimmy::nixtools::misc::{
     get_pipe_fd_from_env, session_start, set_child_subreaper, set_parent_death_signal,
 };
+use shimmy::nixtools::process::TerminationStatus::Exited;
 use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
 use shimmy::nixtools::stdio::{set_stdio, IOStream, IOStreams, StdioPipes};
+use shimmy::runtime::{await_runtime_termination, TerminationStatus};
 use shimmy::syncpipe::SyncPipe;
 
 fn main() {
@@ -71,30 +72,30 @@ fn run_shim(runtime_pid: Pid, runtime_stdio: IOStreams) {
     let mut syncpipe = SyncPipe::new(get_pipe_fd_from_env("_OCI_SYNCPIPE"));
 
     match await_runtime_termination(&mut sigfd, runtime_pid) {
-        RuntimeTermination::Normal { inflight } => {
+        TerminationStatus::Solitary(Exited(.., 0), inflight) => {
             debug!("runtime terminated normally");
             // syncfd.report_container_pid();
             shim_server_run(sigfd, runtime_stdio, inflight);
             // drain master stdio
         }
 
-        RuntimeTermination::NormalWithContainer { container } => {
-            debug!(
-                "runtime terminated normally, container terminated with status: {}",
-                container
-            );
-            // syncfd.report_container_pid();
-            // drain master stdio
+        ts @ TerminationStatus::Solitary(..) => {
+            warn!("runtime terminated abnormally: {}", ts);
+            syncpipe.report_abnormal_runtime_termination(ts, &runtime_stdio.Err.read_all());
         }
 
-        RuntimeTermination::Abnormal { runtime } => {
-            debug!("runtime terminated abnormally: {}", runtime);
-            syncpipe.write_abnormal_runtime_termination(runtime, &runtime_stdio.Err.read_all());
+        ts @ TerminationStatus::Conjoint(..) => {
+            warn!("runtime and container terminated unexpectedly: {}", ts);
+            syncpipe.report_abnormal_runtime_termination(ts, &runtime_stdio.Err.read_all());
         }
     }
 }
 
-fn shim_server_run(sigfd: Signalfd, container_stdio: IOStreams, inflight_signal: Option<Signal>) {
+fn shim_server_run(
+    _sigfd: Signalfd,
+    _container_stdio: IOStreams,
+    _inflight_signal: Option<Signal>,
+) {
     // TODO:
     // read container pid file (runc was supposed to store it on disk before exiting)
     // report container pid back to the parent (using ENV[SYNC_FD])
@@ -122,104 +123,6 @@ fn shim_server_run(sigfd: Signalfd, container_stdio: IOStreams, inflight_signal:
     //         str::from_utf8(&buf).unwrap()
     //     );
     // }
-}
-
-enum RuntimeTermination {
-    Normal { inflight: Option<Signal> },
-    NormalWithContainer { container: TerminationStatus },
-    Abnormal { runtime: TerminationStatus },
-}
-
-fn await_runtime_termination(sigfd: &mut Signalfd, runtime_pid: Pid) -> RuntimeTermination {
-    let mut container: Option<TerminationStatus> = None;
-    let mut inflight: Option<Signal> = None;
-    loop {
-        match sigfd.read_signal() {
-            SIGCHLD => {
-                debug!("SIGCHLD received, querying runtime status.");
-
-                match get_termination_statuses(runtime_pid) {
-                    (Some(rt), ct) => {
-                        assert!(
-                            ct.is_none() || container.is_none(),
-                            "ambiguous container termination status"
-                        );
-                        return dispatch_runtime_termination(rt, container.or(ct), inflight);
-                    }
-
-                    (None, Some(ct)) => {
-                        assert!(
-                            container.is_none(),
-                            "ambiguous container termination status"
-                        );
-                        container = Some(ct); // Keep it for later use.
-                    }
-
-                    (None, None) => (), // Continue...
-                }
-            }
-
-            sig if [SIGINT, SIGQUIT, SIGTERM].contains(&sig) => {
-                debug!("{} received, propagating to runtime.", sig);
-
-                match kill(runtime_pid, sig) {
-                    Ok(KillResult::Delivered) => (), // Keep waiting for runtime termination...
-
-                    Ok(KillResult::ProcessNotFound) => {
-                        // Runtime already has exited, keep the signal
-                        // to send it to the container once we know its PID.
-                        inflight = Some(sig);
-                    }
-
-                    Err(err) => panic!("kill(runtime_pid, {}) failed: {:?}", sig, err),
-                }
-            }
-            sig => panic!("unexpected signal received {:?}", sig),
-        };
-    }
-}
-
-fn get_termination_statuses(
-    runtime_pid: Pid,
-) -> (Option<TerminationStatus>, Option<TerminationStatus>) {
-    let mut runtime: Option<TerminationStatus> = None;
-    let mut container: Option<TerminationStatus> = None;
-
-    while let Some(status) = get_child_termination_status() {
-        if status.pid() == runtime_pid {
-            assert!(runtime.is_none());
-            runtime = Some(status);
-        } else {
-            assert!(container.is_none());
-            container = Some(status);
-        }
-    }
-
-    (runtime, container)
-}
-
-fn dispatch_runtime_termination(
-    runtime: TerminationStatus,
-    container: Option<TerminationStatus>,
-    inflight: Option<Signal>,
-) -> RuntimeTermination {
-    if runtime.exited_with_code(0) {
-        match container {
-            None => RuntimeTermination::Normal { inflight },
-
-            Some(container) => {
-                if let Some(sig) = inflight {
-                    warn!(
-                        "{} received but both runtime and container have been already terminated",
-                        sig
-                    );
-                }
-                RuntimeTermination::NormalWithContainer { container }
-            }
-        }
-    } else {
-        RuntimeTermination::Abnormal { runtime }
-    }
 }
 
 fn write_pid_file_and_exit<P: AsRef<Path>>(filename: P, pid: Pid) {
