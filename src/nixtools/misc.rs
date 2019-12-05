@@ -1,4 +1,3 @@
-use std::env;
 use std::os::unix::io::RawFd;
 
 use libc::{self, c_int, c_ulong};
@@ -8,9 +7,8 @@ use nix::sys::signal::Signal;
 use nix::unistd::setsid;
 use nix::Result;
 
-pub fn get_pipe_fd_from_env(name: &str) -> RawFd {
-    let str_fd = env::var(name).expect("failed to get pipe fd from ENV");
-    let fd = str_fd.parse::<c_int>().expect("ENV fd is not a number");
+pub fn to_pipe_fd(str_fd: &str) -> RawFd {
+    let fd = str_fd.parse::<c_int>().expect("fd is not a number");
 
     match fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)) {
         Ok(rv) if rv != -1 => (),
