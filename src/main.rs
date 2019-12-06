@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::fs;
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::str::FromStr;
@@ -263,4 +264,8 @@ fn setup_logger(level: log::LevelFilter) {
     log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
         .map(|()| log::set_max_level(level))
         .expect("log::set_boxed_logger() failed");
+
+    panic::set_hook(Box::new(|info| {
+        error!("{}", info);
+    }));
 }
