@@ -62,4 +62,3 @@ impl SyncPipe {
         self.0.write_all(&msg).expect("SyncPipe.write() failed");
     }
 }
-

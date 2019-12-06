@@ -45,6 +45,14 @@ struct CliOpt {
     #[structopt(long = "runtime-arg", multiple = true)]
     runtime_args: Vec<String>,
 
+    /// container bundle path
+    #[structopt(long = "bundle", short = "b", parse(from_os_str))]
+    bundle: PathBuf,
+
+    /// container id
+    #[structopt(long = "container-id", short = "c")]
+    container_id: String,
+
     /// container pidfile
     #[structopt(long = "container-pidfile", short = "p", parse(from_os_str))]
     container_pidfile: PathBuf,
@@ -53,13 +61,9 @@ struct CliOpt {
     #[structopt(long = "container-log-path", short = "l", parse(from_os_str))]
     container_logfile: PathBuf,
 
-    /// container id
-    #[structopt(long = "cid", short = "c")]
-    container_id: String,
-
-    /// container bundle path
-    #[structopt(long = "bundle", short = "b", parse(from_os_str))]
-    bundle: PathBuf,
+    /// container exit dir
+    #[structopt(long = "container-exit-dir", short = "e", parse(from_os_str))]
+    container_exit_dir: PathBuf,
 }
 
 fn main() {
@@ -72,7 +76,8 @@ fn main() {
     match fork() {
         Ok(ForkResult::Parent { child }) => {
             // Main process (cont.)
-            write_runtime_pidfile_and_exit(opt.pidfile, child);
+            write_runtime_pidfile(opt.pidfile, child);
+            exit(0);
         }
         Ok(ForkResult::Child) => (), // Shim process
         Err(err) => panic!("fork() of the shim process failed: {}", err),
@@ -97,8 +102,11 @@ fn main() {
             // Container runtime process
             debug!("[runtime] I've been forked!");
 
-            // TODO: check does it still work after exec
+            // This will kill only runc top process (if it's still alive).
+            // Forked by runc processes (i.e. init and container itself)
+            // will not be affected (for better or for worse).
             set_parent_death_signal(SIGKILL);
+
             signals_restore(&oldmask);
             set_stdio(iopipes.slave);
             exec_oci_runtime_or_exit(RuntimeCommand {
@@ -116,29 +124,32 @@ fn main() {
     // Shim process (cont.)
     iopipes.slave.close_all();
 
-    run_shim(
-        &opt.syncpipe_fd,
-        runtime_pid,
+    let mut sigfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
+
+    debug!("[shim] awaiting runtime termination...");
+    if let Some(status) = run_shim(
+        await_runtime_termination(&mut sigfd, runtime_pid),
         iopipes.master,
         opt.container_pidfile,
-    );
+        sigfd,
+        SyncPipe::new(to_pipe_fd(&opt.syncpipe_fd)),
+    ) {
+        save_container_termination_status(opt.container_exit_dir.join(opt.container_id), status);
+    }
+
     info!("[shim] shimmy says bye!");
 }
 
 fn run_shim(
-    syncpipe_fd: &str,
-    runtime_pid: Pid,
+    runtime_status: RuntimeTerminationStatus,
     runtime_stdio: IOStreams,
     container_pidfile: PathBuf,
-) {
+    mut sigfd: Signalfd,
+    mut syncpipe: SyncPipe,
+) -> Option<ProcessTerminationStatus> {
     use ProcessTerminationStatus::Exited;
 
-    let mut sigfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
-    let mut syncpipe = SyncPipe::new(to_pipe_fd(syncpipe_fd));
-
-    debug!("[shim] awaiting runtime termination...");
-
-    match await_runtime_termination(&mut sigfd, runtime_pid) {
+    return match runtime_status {
         RuntimeTerminationStatus::Solitary(Exited(.., 0), inflight) => {
             debug!("[shim] runtime terminated normally");
 
@@ -150,16 +161,14 @@ fn run_shim(
                 deliver_inflight_signal(container_pid, sig);
             }
 
-            save_container_termination_status(serve_container(
-                &mut sigfd,
-                container_pid,
-                runtime_stdio,
-            ));
+            Some(serve_container(&mut sigfd, container_pid, runtime_stdio))
         }
 
         ts @ RuntimeTerminationStatus::Solitary(..) => {
             warn!("[shim] runtime terminated abnormally: {}", ts);
             syncpipe.report_abnormal_runtime_termination(ts, &runtime_stdio.Err.read_all());
+
+            None
         }
 
         ts @ RuntimeTerminationStatus::Conjoint(..) => {
@@ -168,8 +177,10 @@ fn run_shim(
                 ts
             );
             syncpipe.report_abnormal_runtime_termination(ts, &runtime_stdio.Err.read_all());
+
+            None
         }
-    }
+    };
 }
 
 fn deliver_inflight_signal(container_pid: Pid, signal: Signal) {
@@ -182,7 +193,24 @@ fn deliver_inflight_signal(container_pid: Pid, signal: Signal) {
     }
 }
 
-fn save_container_termination_status(_status: ProcessTerminationStatus) {}
+fn save_container_termination_status<P: AsRef<Path>>(
+    filename: P,
+    status: ProcessTerminationStatus,
+) {
+    debug!(
+        "[shim] saving container termination status {} to {}",
+        status,
+        filename.as_ref().display()
+    );
+
+    if let Err(err) = fs::write(&filename, format!("{}", status)) {
+        panic!(
+            "write() to container exit file {} failed: {}",
+            filename.as_ref().display(),
+            err
+        )
+    }
+}
 
 fn read_container_pidfile<P: AsRef<Path>>(filename: P) -> Pid {
     let content = fs::read_to_string(&filename).expect("fs::read_to_string() failed");
@@ -193,7 +221,7 @@ fn read_container_pidfile<P: AsRef<Path>>(filename: P) -> Pid {
     );
 }
 
-fn write_runtime_pidfile_and_exit<P: AsRef<Path>>(filename: P, pid: Pid) {
+fn write_runtime_pidfile<P: AsRef<Path>>(filename: P, pid: Pid) {
     debug!(
         "[main] writing shim PID {} to pidfile {}",
         pid,
@@ -203,11 +231,10 @@ fn write_runtime_pidfile_and_exit<P: AsRef<Path>>(filename: P, pid: Pid) {
     if let Err(err) = fs::write(&filename, format!("{}", pid)) {
         panic!(
             "write() to pidfile {} failed: {}",
-            filename.as_ref().to_string_lossy(),
+            filename.as_ref().display(),
             err
         )
     }
-    exit(0);
 }
 
 struct RuntimeCommand {
