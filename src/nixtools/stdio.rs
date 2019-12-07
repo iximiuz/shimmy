@@ -20,14 +20,14 @@ pub enum IOStream {
 }
 
 impl IOStream {
-    pub fn read(&self, buf: &mut [u8]) -> usize {
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         if let Self::Fd(fd) = self {
             let mut file = unsafe { File::from_raw_fd(*fd) };
-            let nread = file.read(buf).expect("read() failed");
+            let res = file.read(buf);
             mem::forget(file); // omit the destruciton of the file, i.e. no call to close(fd).
-            nread
+            res
         } else {
-            0
+            Ok(0)
         }
     }
 
