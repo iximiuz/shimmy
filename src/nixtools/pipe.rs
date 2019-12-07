@@ -1,7 +1,8 @@
 use std::os::unix::io::RawFd;
 
+use log::error;
 use nix::fcntl::OFlag;
-use nix::unistd::pipe2;
+use nix::unistd::{close, pipe2};
 
 pub struct Pipe {
     rd: RawFd,
@@ -19,5 +20,16 @@ impl Pipe {
     }
     pub fn wr(&self) -> RawFd {
         self.wr
+    }
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        if let Err(err) = close(self.rd) {
+            error!("close({}) pipe.rd failed: {}", self.rd, err);
+        }
+        if let Err(err) = close(self.wr) {
+            error!("close({}) pipe.wr failed: {}", self.wr, err);
+        }
     }
 }

@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::str::FromStr;
 
-use libc::_exit;
 use log::{debug, error, info, warn};
 use nix::sys::signal::Signal;
 use nix::sys::signal::Signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
@@ -15,9 +14,11 @@ use syslog::{BasicLogger, Facility, Formatter3164};
 
 use shimmy::container::serve_container;
 use shimmy::nixtools::misc::{
-    session_start, set_child_subreaper, set_parent_death_signal, to_pipe_fd,
+    _exit, session_start, set_child_subreaper, set_parent_death_signal, to_pipe_fd,
 };
-use shimmy::nixtools::process::{kill, KillResult, TerminationStatus as ProcessTerminationStatus};
+use shimmy::nixtools::process::{
+    kill, KillResult, TerminationStatus as ProcessTerminationStatus, TerminationStatus::Exited,
+};
 use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
 use shimmy::nixtools::stdio::{set_stdio, IOStream, IOStreams, StdioPipes};
 use shimmy::runtime::{await_runtime_termination, TerminationStatus as RuntimeTerminationStatus};
@@ -36,7 +37,7 @@ struct CliOpt {
 
     /// sync pipe file descriptor
     #[structopt(short = "S", long = "syncpipe-fd", env = "_OCI_SYNCPIPE")]
-    syncpipe_fd: String,
+    syncpipe_fd: i32,
 
     /// runtime executable path (eg. /usr/bin/runc)
     #[structopt(long = "runtime", short = "r", parse(from_os_str))]
@@ -86,7 +87,7 @@ fn main() {
     // Shim process (cont.)
     debug!("[shim] initializing...");
 
-    set_stdio(IOStreams {
+    set_stdio(&IOStreams {
         In: IOStream::DevNull,
         Out: IOStream::DevNull,
         Err: IOStream::DevNull,
@@ -108,79 +109,48 @@ fn main() {
             set_parent_death_signal(SIGKILL);
 
             signals_restore(&oldmask);
-            set_stdio(iopipes.slave);
-            exec_oci_runtime_or_exit(RuntimeCommand {
+            set_stdio(&iopipes.slave);
+            exec_oci_runtime(RuntimeCommand {
                 runtime_path: opt.runtime_path,
                 runtime_args: opt.runtime_args,
                 container_id: opt.container_id,
                 pidfile: opt.container_pidfile,
                 bundle: opt.bundle,
             });
-            unreachable!();
+            _exit(127);
         }
         Err(err) => panic!("fork() of the container runtime process failed: {}", err),
     };
 
     // Shim process (cont.)
-    iopipes.slave.close_all();
+    drop(iopipes.slave);
 
     let mut sigfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
-
-    debug!("[shim] awaiting runtime termination...");
-    if let Some(status) = run_shim(
-        await_runtime_termination(&mut sigfd, runtime_pid),
-        iopipes.master,
-        opt.container_pidfile,
-        sigfd,
-        SyncPipe::new(to_pipe_fd(&opt.syncpipe_fd)),
-    ) {
-        save_container_termination_status(opt.container_exit_dir.join(opt.container_id), status);
-    }
-
-    info!("[shim] shimmy says bye!");
-}
-
-fn run_shim(
-    runtime_status: RuntimeTerminationStatus,
-    runtime_stdio: IOStreams,
-    container_pidfile: PathBuf,
-    mut sigfd: Signalfd,
-    mut syncpipe: SyncPipe,
-) -> Option<ProcessTerminationStatus> {
-    use ProcessTerminationStatus::Exited;
-
-    return match runtime_status {
+    match await_runtime_termination(&mut sigfd, runtime_pid) {
         RuntimeTerminationStatus::Solitary(Exited(.., 0), inflight) => {
             debug!("[shim] runtime terminated normally");
 
-            let container_pid = read_container_pidfile(container_pidfile);
-            syncpipe.report_container_pid(container_pid);
-            drop(syncpipe);
+            let container_pid = read_container_pidfile(opt.container_pidfile);
+            SyncPipe::new(to_pipe_fd(opt.syncpipe_fd)).report_container_pid(container_pid);
 
             if let Some(sig) = inflight {
                 deliver_inflight_signal(container_pid, sig);
             }
 
-            Some(serve_container(&mut sigfd, container_pid, runtime_stdio))
-        }
-
-        ts @ RuntimeTerminationStatus::Solitary(..) => {
-            warn!("[shim] runtime terminated abnormally: {}", ts);
-            syncpipe.report_abnormal_runtime_termination(ts, &runtime_stdio.Err.read_all());
-
-            None
-        }
-
-        ts @ RuntimeTerminationStatus::Conjoint(..) => {
-            warn!(
-                "[shim] runtime and container terminated unexpectedly: {}",
-                ts
+            save_container_termination_status(
+                opt.container_exit_dir.join(opt.container_id),
+                serve_container(sigfd, container_pid, iopipes.master, opt.container_logfile),
             );
-            syncpipe.report_abnormal_runtime_termination(ts, &runtime_stdio.Err.read_all());
-
-            None
         }
-    };
+
+        ts => {
+            warn!("[shim] runtime terminated abnormally: {}", ts);
+            SyncPipe::new(to_pipe_fd(opt.syncpipe_fd))
+                .report_abnormal_runtime_termination(ts, &iopipes.master.Err.read_all());
+        }
+    }
+
+    info!("[shim] shimmy says bye!");
 }
 
 fn deliver_inflight_signal(container_pid: Pid, signal: Signal) {
@@ -198,7 +168,7 @@ fn save_container_termination_status<P: AsRef<Path>>(
     status: ProcessTerminationStatus,
 ) {
     debug!(
-        "[shim] saving container termination status {} to {}",
+        "[shim] saving container termination status [{}] to {}",
         status,
         filename.as_ref().display()
     );
@@ -223,17 +193,13 @@ fn read_container_pidfile<P: AsRef<Path>>(filename: P) -> Pid {
 
 fn write_runtime_pidfile<P: AsRef<Path>>(filename: P, pid: Pid) {
     debug!(
-        "[main] writing shim PID {} to pidfile {}",
+        "[main] writing shim PID {} to {}",
         pid,
         filename.as_ref().display()
     );
 
     if let Err(err) = fs::write(&filename, format!("{}", pid)) {
-        panic!(
-            "write() to pidfile {} failed: {}",
-            filename.as_ref().display(),
-            err
-        )
+        panic!("write() to {} failed: {}", filename.as_ref().display(), err)
     }
 }
 
@@ -265,17 +231,12 @@ impl RuntimeCommand {
     }
 }
 
-fn exec_oci_runtime_or_exit(cmd: RuntimeCommand) {
+fn exec_oci_runtime(cmd: RuntimeCommand) {
     let argv = cmd.to_argv();
     debug!("[runtime] execing runc: {:?}", &argv);
 
     if let Err(err) = execv(&argv[0], &argv) {
-        error!("[runtime] execv() failed: {}", err);
         panic!("execv() failed: {}", err);
-    }
-
-    unsafe {
-        _exit(127);
     }
 }
 

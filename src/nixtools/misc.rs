@@ -7,8 +7,8 @@ use nix::sys::signal::Signal;
 use nix::unistd::setsid;
 use nix::Result;
 
-pub fn to_pipe_fd(str_fd: &str) -> RawFd {
-    let fd = str_fd.parse::<c_int>().expect("fd is not a number");
+pub fn to_pipe_fd(maybe_fd: i32) -> RawFd {
+    let fd = maybe_fd as c_int;
 
     match fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)) {
         Ok(rv) if rv != -1 => (),
@@ -30,6 +30,12 @@ pub fn set_child_subreaper() {
 pub fn set_parent_death_signal(sig: Signal) {
     prctl(PrctlOption::PR_SET_PDEATHSIG, sig as c_ulong, 0, 0, 0)
         .expect("prctl(PR_SET_PDEATHSIG) failed");
+}
+
+pub fn _exit(status: libc::c_int) -> ! {
+    unsafe {
+        libc::_exit(status);
+    }
 }
 
 #[repr(i32)]

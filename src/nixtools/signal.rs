@@ -1,3 +1,5 @@
+use std::os::unix::io::{AsRawFd, RawFd};
+
 use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow, Signal};
 use nix::sys::signalfd;
 
@@ -17,26 +19,30 @@ pub fn signals_restore(mask: &SigSet) {
         .expect("sigprocmask(SIG_SETMASK) failed");
 }
 
-pub struct Signalfd {
-    sfd: signalfd::SignalFd,
-}
+pub struct Signalfd(signalfd::SignalFd);
 
 impl Signalfd {
     pub fn new(signals: &[Signal]) -> Self {
-        Self {
-            sfd: signalfd::SignalFd::new(&sigmask(signals))
+        Self(
+            signalfd::SignalFd::new(&sigmask(signals))
                 .expect(&format!("signalfd() failed for mask {:?}", signals)),
-        }
+        )
     }
 
     pub fn read_signal(&mut self) -> Signal {
-        match self.sfd.read_signal() {
+        match self.0.read_signal() {
             Ok(Some(sinfo)) => {
                 Signal::from_c_int(sinfo.ssi_signo as libc::c_int).expect("unexpected signo")
             }
             Ok(None) => panic!("wtf? We are in blocking mode"),
             Err(err) => panic!("read(signalfd) failed {}", err),
         }
+    }
+}
+
+impl AsRawFd for Signalfd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
     }
 }
 

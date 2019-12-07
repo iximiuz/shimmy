@@ -56,12 +56,14 @@ impl TerminationStatus {
 }
 
 pub fn await_runtime_termination(sigfd: &mut Signalfd, runtime_pid: Pid) -> TerminationStatus {
+    debug!("[shim] awaiting runtime termination...");
+
     let mut container: Option<ProcessTerminationStatus> = None;
     let mut inflight: Option<Signal> = None;
     loop {
         match sigfd.read_signal() {
             SIGCHLD => {
-                debug!("SIGCHLD received, querying runtime status.");
+                debug!("[shim] SIGCHLD received, querying runtime status");
 
                 match get_termination_statuses(runtime_pid) {
                     (Some(rt), ct) => {
@@ -85,7 +87,7 @@ pub fn await_runtime_termination(sigfd: &mut Signalfd, runtime_pid: Pid) -> Term
             }
 
             sig if [SIGINT, SIGQUIT, SIGTERM].contains(&sig) => {
-                debug!("{} received, propagating to runtime.", sig);
+                debug!("[shim] {} received, propagating to runtime", sig);
 
                 match kill(runtime_pid, sig) {
                     Ok(KillResult::Delivered) => (), // Keep waiting for runtime termination...
