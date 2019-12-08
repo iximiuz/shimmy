@@ -1,5 +1,9 @@
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::io;
+use std::os::unix::io::AsRawFd;
 
+use mio::event::Evented;
+use mio::unix::EventedFd;
+use mio::{Poll, PollOpt, Ready, Token};
 use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow, Signal};
 use nix::sys::signalfd;
 
@@ -40,9 +44,29 @@ impl Signalfd {
     }
 }
 
-impl AsRawFd for Signalfd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+impl Evented for Signalfd {
+    fn register(
+        &self,
+        poll: &Poll,
+        token: Token,
+        interest: Ready,
+        opts: PollOpt,
+    ) -> io::Result<()> {
+        EventedFd(&self.0.as_raw_fd()).register(poll, token, interest, opts)
+    }
+
+    fn reregister(
+        &self,
+        poll: &Poll,
+        token: Token,
+        interest: Ready,
+        opts: PollOpt,
+    ) -> io::Result<()> {
+        EventedFd(&self.0.as_raw_fd()).reregister(poll, token, interest, opts)
+    }
+
+    fn deregister(&self, poll: &Poll) -> io::Result<()> {
+        EventedFd(&self.0.as_raw_fd()).deregister(poll)
     }
 }
 

@@ -26,24 +26,14 @@ pub fn serve_container<P: AsRef<Path>>(
     server.register_container_stdout(container_stdio.Out);
     server.register_container_stderr(container_stdio.Err);
 
-    server.run();
-
-    if let Some(_stream) = server.container_stdout() {
-        // TODO: drain to logs
-    }
-    if let Some(_stream) = server.container_stderr() {
-        // TODO: drain to logs
-    }
-
-    server.container_status()
+    server.run()
 }
 
 mod reactor {
-    use std::os::unix::io::AsRawFd;
     use std::time::Duration;
 
     use log::{debug, error, warn};
-    use mio::unix::{EventedFd, UnixReady};
+    use mio::unix::UnixReady;
     use mio::{Event, Events, Poll, PollOpt, Ready, Token};
     use nix::sys::signal::{Signal, Signal::SIGCHLD};
     use nix::unistd::Pid;
@@ -117,7 +107,7 @@ mod reactor {
             if let Some(sigfd) = &self.sigfd {
                 self.poll
                     .register(
-                        &EventedFd(&sigfd.as_raw_fd()),
+                        sigfd,
                         TOKEN_SIGNAL,
                         Ready::readable() | UnixReady::error() | UnixReady::hup(),
                         PollOpt::level(),
@@ -126,24 +116,27 @@ mod reactor {
             }
         }
 
-        pub fn run(&mut self) {
+        pub fn run(&mut self) -> TerminationStatus {
             while self.cont_status.is_none() {
                 if self.poll_once() == 0 {
                     debug!("[shim] still serving container {}", self.cont_pid);
                 }
             }
-        }
 
-        pub fn container_status(&mut self) -> TerminationStatus {
-            std::mem::replace(&mut self.cont_status, None).expect("did you call run() first?")
-        }
+            // Drain stdout & stderr.
+            self.heartbeat = Duration::from_millis(0);
+            if let Some(sigfd) = &self.sigfd {
+                self.poll
+                    .deregister(sigfd)
+                    .expect("mio::Poll::deregister(sigfd) failed");
+                self.sigfd = None;
+            }
 
-        pub fn container_stdout(&mut self) -> Option<IOStream> {
-            std::mem::replace(&mut self.cont_stdout, None)
-        }
+            while self.poll_once() != 0 {
+                debug!("[shim] draining container IO streams");
+            }
 
-        pub fn container_stderr(&mut self) -> Option<IOStream> {
-            std::mem::replace(&mut self.cont_stderr, None)
+            self.cont_status.unwrap()
         }
 
         fn poll_once(&mut self) -> i32 {
