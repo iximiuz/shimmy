@@ -161,6 +161,7 @@ mod reactor {
                 if event.readiness().is_readable() {
                     let mut buf = [0; 16 * 1024];
                     match stream.read(&mut buf) {
+                        Ok(0) => (),
                         Ok(nread) => self.log_writer.write_container_stdout(&buf[..nread]),
                         Err(err) => warn!("[shim] container's STDOUT errored: {}", err),
                     }
@@ -187,6 +188,7 @@ mod reactor {
                 if event.readiness().is_readable() {
                     let mut buf = [0; 16 * 1024];
                     match stream.read(&mut buf) {
+                        Ok(0) => (),
                         Ok(nread) => self.log_writer.write_container_stderr(&buf[..nread]),
                         Err(err) => warn!("[shim] container's STDERR errored: {}", err),
                     }
@@ -293,7 +295,7 @@ mod logwriter {
 
         fn write(&mut self, stream: &'static str, data: &[u8]) {
             let now = Utc::now().format("%Y-%m-%dT%H:%M:%S");
-            for line in data.split(|c| *c == b'\n') {
+            for line in data.split(|c| *c == b'\n').filter(|l| l.len() > 0) {
                 write!(
                     self.file,
                     "{} {} {}\n",
