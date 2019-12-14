@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::str::FromStr;
 
+use chrono::Utc;
 use log::{debug, error, info, warn};
-use nix::sys::signal::Signal;
-use nix::sys::signal::Signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
+use nix::sys::signal::{
+    Signal,
+    Signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM},
+};
 use nix::unistd::{execv, fork, ForkResult, Pid};
 use structopt::StructOpt;
 use syslog::{BasicLogger, Facility, Formatter3164};
@@ -17,7 +20,8 @@ use shimmy::nixtools::misc::{
     _exit, session_start, set_child_subreaper, set_parent_death_signal, to_pipe_fd,
 };
 use shimmy::nixtools::process::{
-    kill, KillResult, TerminationStatus as ProcessTerminationStatus, TerminationStatus::Exited,
+    kill, KillResult, TerminationStatus as ProcessTerminationStatus,
+    TerminationStatus::{Exited, Signaled},
 };
 use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
 use shimmy::nixtools::stdio::{set_stdio, IOStream, IOStreams, StdioPipes};
@@ -27,44 +31,37 @@ use shimmy::syncpipe::SyncPipe;
 #[derive(Debug, StructOpt)]
 #[structopt(name = "shimmy", about = "shimmy command line arguments")]
 struct CliOpt {
-    /// shimmy pidfile
-    #[structopt(long = "shimmy-pidfile", short = "P", parse(from_os_str))]
+    #[structopt(long = "shimmy-pidfile", parse(from_os_str))]
     pidfile: PathBuf,
 
-    /// shimmy log level
     #[structopt(long = "shimmy-log-level", default_value = "INFO", parse(try_from_str = log::LevelFilter::from_str))]
     loglevel: log::LevelFilter,
 
     /// sync pipe file descriptor
-    #[structopt(short = "S", long = "syncpipe-fd", env = "_OCI_SYNCPIPE")]
+    #[structopt(long = "syncpipe-fd", env = "_OCI_SYNCPIPE")]
     syncpipe_fd: i32,
 
     /// runtime executable path (eg. /usr/bin/runc)
-    #[structopt(long = "runtime", short = "r", parse(from_os_str))]
+    #[structopt(long = "runtime", parse(from_os_str))]
     runtime_path: PathBuf,
 
     #[structopt(long = "runtime-arg", multiple = true)]
     runtime_args: Vec<String>,
 
-    /// container bundle path
-    #[structopt(long = "bundle", short = "b", parse(from_os_str))]
+    #[structopt(long = "bundle", parse(from_os_str))]
     bundle: PathBuf,
 
-    /// container id
-    #[structopt(long = "container-id", short = "c")]
+    #[structopt(long = "container-id")]
     container_id: String,
 
-    /// container pidfile
-    #[structopt(long = "container-pidfile", short = "p", parse(from_os_str))]
+    #[structopt(long = "container-pidfile", parse(from_os_str))]
     container_pidfile: PathBuf,
 
-    /// container logfile
-    #[structopt(long = "container-log-path", short = "l", parse(from_os_str))]
+    #[structopt(long = "container-logfile", parse(from_os_str))]
     container_logfile: PathBuf,
 
-    /// container exit dir
-    #[structopt(long = "container-exit-dir", short = "e", parse(from_os_str))]
-    container_exit_dir: PathBuf,
+    #[structopt(long = "container-exitfile", parse(from_os_str))]
+    container_exitfile: PathBuf,
 }
 
 fn main() {
@@ -138,7 +135,7 @@ fn main() {
             }
 
             save_container_termination_status(
-                opt.container_exit_dir.join(opt.container_id),
+                opt.container_exitfile,
                 serve_container(sigfd, container_pid, iopipes.master, opt.container_logfile),
             );
         }
@@ -173,7 +170,18 @@ fn save_container_termination_status<P: AsRef<Path>>(
         filename.as_ref().display()
     );
 
-    if let Err(err) = fs::write(&filename, format!("{}", status)) {
+    let now = Utc::now().to_rfc3339();
+    let message = match status {
+        Exited(.., code) => format!(
+            r#"{{"at": "{}", "reason": "exited", "exitCode": {}}}"#,
+            now, code,
+        ),
+        Signaled(.., sig) => format!(
+            r#"{{"at": "{}", "reason": "signaled", "signal": {}}}"#,
+            now, sig as libc::c_int,
+        ),
+    };
+    if let Err(err) = fs::write(&filename, message) {
         panic!(
             "write() to container exit file {} failed: {}",
             filename.as_ref().display(),

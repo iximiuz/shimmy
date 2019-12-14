@@ -294,12 +294,11 @@ mod logwriter {
         }
 
         fn write(&mut self, stream: &'static str, data: &[u8]) {
-            let now = Utc::now().format("%Y-%m-%dT%H:%M:%S");
             for line in data.split(|c| *c == b'\n').filter(|l| l.len() > 0) {
                 write!(
                     self.file,
                     "{} {} {}\n",
-                    now,
+                    Utc::now().to_rfc3339(),
                     stream,
                     String::from_utf8_lossy(line)
                 )
