@@ -14,3 +14,7 @@ Similar projects:
 - <a href="https://github.com/containers/conmon">conmon</a>
 - <a href="https://github.com/containerd/containerd/blob/master/runtime/v2/shim.go">containerd runtime shim</a>
 
+Read more about the project on my blog:
+
+- <a href="https://iximiuz.com/en/posts/implementing-container-runtime-shim">Implementing container runtime shim: runc</a>
+- <a href="https://iximiuz.com/en/posts/implementing-container-runtime-shim-2">Implementing container runtime shim: first code</a>
