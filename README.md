@@ -18,3 +18,17 @@ Read more about the project on my blog:
 
 - <a href="https://iximiuz.com/en/posts/implementing-container-runtime-shim">Implementing container runtime shim: runc</a>
 - <a href="https://iximiuz.com/en/posts/implementing-container-runtime-shim-2">Implementing container runtime shim: first code</a>
+
+## Usage
+
+```bash
+# build debug version
+cargo build --bin shimmy
+
+# build release version
+cargo build --bin shimmy --release
+
+# integrational tests (conman is required)
+https://github.com/iximiuz/conman/blob/v0.0.2/test/shimmy/shimmy_test.go
+```
+
