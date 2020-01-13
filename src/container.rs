@@ -4,12 +4,14 @@ use std::time::Duration;
 use log::debug;
 use nix::unistd::Pid;
 
+use crate::attach::Listener as AttachListener;
 use crate::nixtools::process::TerminationStatus;
 use crate::nixtools::signal::Signalfd;
 use crate::nixtools::stdio::IOStreams;
 
 pub fn serve_container<P: AsRef<Path>>(
     sigfd: Signalfd,
+    attach_listener: AttachListener,
     container_pid: Pid,
     container_stdio: IOStreams,
     container_logfile: P,
@@ -23,6 +25,7 @@ pub fn serve_container<P: AsRef<Path>>(
     );
 
     server.register_signalfd(sigfd);
+    server.register_attach_listener(attach_listener);
     server.register_container_stdout(container_stdio.Out);
     server.register_container_stderr(container_stdio.Err);
 
@@ -38,6 +41,7 @@ mod reactor {
     use nix::sys::signal::{Signal, Signal::SIGCHLD};
     use nix::unistd::Pid;
 
+    use crate::attach::Listener as AttachListener;
     use crate::container::logwriter::LogWriter;
     use crate::nixtools::process::{
         get_child_termination_status, kill, KillResult, TerminationStatus,
@@ -48,6 +52,7 @@ mod reactor {
     const TOKEN_STDOUT: Token = Token(10);
     const TOKEN_STDERR: Token = Token(20);
     const TOKEN_SIGNAL: Token = Token(30);
+    const TOKEN_ATTACH: Token = Token(40);
 
     pub struct Reactor {
         poll: Poll,
@@ -58,6 +63,7 @@ mod reactor {
         cont_stdout: Option<IOStream>,
         cont_stderr: Option<IOStream>,
         sigfd: Option<Signalfd>,
+        attach_listener: Option<AttachListener>,
     }
 
     impl Reactor {
@@ -71,6 +77,7 @@ mod reactor {
                 cont_stdout: None,
                 cont_stderr: None,
                 sigfd: None,
+                attach_listener: None,
             }
         }
 
@@ -116,6 +123,20 @@ mod reactor {
             }
         }
 
+        pub fn register_attach_listener(&mut self, listener: AttachListener) {
+            self.attach_listener = Some(listener);
+            if let Some(listener) = &self.attach_listener {
+                self.poll
+                    .register(
+                        listener,
+                        TOKEN_ATTACH,
+                        Ready::readable() | UnixReady::error(),
+                        PollOpt::level(),
+                    )
+                    .expect("mio::Poll::register(signalfd) failed");
+            }
+        }
+
         pub fn run(&mut self) -> TerminationStatus {
             while self.cont_status.is_none() {
                 if self.poll_once() == 0 {
@@ -150,6 +171,7 @@ mod reactor {
                     TOKEN_STDOUT => self.handle_cont_stdout_event(&event),
                     TOKEN_STDERR => self.handle_cont_stderr_event(&event),
                     TOKEN_SIGNAL => self.handle_signalfd_event(&event),
+                    TOKEN_ATTACH => self.handle_attach_event(&event),
                     _ => unreachable!(),
                 }
             }
@@ -234,6 +256,22 @@ mod reactor {
             assert!(self.cont_status.is_none());
             assert!(self.cont_pid == status.pid());
             self.cont_status = Some(status);
+        }
+
+        fn handle_attach_event(&mut self, event: &Event) {
+            if let Some(ref mut listener) = self.attach_listener {
+                if !event.readiness().is_readable() {
+                    error!(
+                        "[shim] attach listener errored: {:?}",
+                        listener.take_error()
+                    );
+                    return;
+                }
+                match listener.accept() {
+                    Ok((_, addr)) => debug!("[shim] new attach socket conn {:?}", addr),
+                    Err(err) => error!("[shim] attach listener accept failed: {}", err),
+                }
+            }
         }
     }
 

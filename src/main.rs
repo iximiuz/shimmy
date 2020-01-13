@@ -15,6 +15,7 @@ use nix::unistd::{execv, fork, ForkResult, Pid};
 use structopt::StructOpt;
 use syslog::{BasicLogger, Facility, Formatter3164};
 
+use shimmy::attach::Listener as AttachListener;
 use shimmy::container::serve_container;
 use shimmy::nixtools::misc::{
     _exit, session_start, set_child_subreaper, set_parent_death_signal, to_pipe_fd,
@@ -91,6 +92,7 @@ fn main() {
     });
     session_start();
     set_child_subreaper();
+
     let oldmask = signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
     let iopipes = StdioPipes::new();
 
@@ -127,6 +129,9 @@ fn main() {
         RuntimeTerminationStatus::Solitary(Exited(.., 0), inflight) => {
             debug!("[shim] runtime terminated normally");
 
+            // Make sure attach socket is ready before reporting the readiness back.
+            let attach_listener = AttachListener::new(&opt.bundle.join("attach"));
+
             let container_pid = read_container_pidfile(opt.container_pidfile);
             SyncPipe::new(to_pipe_fd(opt.syncpipe_fd)).report_container_pid(container_pid);
 
@@ -136,7 +141,13 @@ fn main() {
 
             save_container_termination_status(
                 opt.container_exitfile,
-                serve_container(sigfd, container_pid, iopipes.master, opt.container_logfile),
+                serve_container(
+                    sigfd,
+                    attach_listener,
+                    container_pid,
+                    iopipes.master,
+                    opt.container_logfile,
+                ),
             );
         }
 
