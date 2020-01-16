@@ -20,19 +20,21 @@ pub fn serve_container<P: AsRef<Path>>(
 
     let mut server = reactor::Reactor::new(
         container_pid,
-        logwriter::LogWriter::new(container_logfile),
         Duration::from_millis(5000),
+        logwriter::LogWriter::new(container_logfile),
     );
 
-    server.register_signalfd(sigfd);
-    server.register_attach_listener(attach_listener);
     server.register_container_stdout(container_stdio.Out);
     server.register_container_stderr(container_stdio.Err);
+    server.register_signalfd(sigfd);
+    server.register_attach_server(reactor::AttachServer::new(attach_listener));
 
     server.run()
 }
 
 mod reactor {
+    use std::collections::HashMap;
+    use std::io;
     use std::time::Duration;
 
     use log::{debug, error, warn};
@@ -41,7 +43,7 @@ mod reactor {
     use nix::sys::signal::{Signal, Signal::SIGCHLD};
     use nix::unistd::Pid;
 
-    use crate::attach::Listener as AttachListener;
+    use crate::attach::{Connection as AttachConnection, Listener as AttachListener};
     use crate::container::logwriter::LogWriter;
     use crate::nixtools::process::{
         get_child_termination_status, kill, KillResult, TerminationStatus,
@@ -54,30 +56,56 @@ mod reactor {
     const TOKEN_SIGNAL: Token = Token(30);
     const TOKEN_ATTACH: Token = Token(40);
 
+    pub struct AttachServer {
+        listener: AttachListener,
+        connections: HashMap<Token, AttachConnection>,
+        next_conn_index: usize,
+    }
+
+    impl AttachServer {
+        pub fn new(listener: AttachListener) -> Self {
+            Self {
+                listener: listener,
+                connections: HashMap::new(),
+                next_conn_index: usize::from(TOKEN_ATTACH) + 1,
+            }
+        }
+
+        fn accept(&mut self) -> io::Result<(&AttachConnection, Token)> {
+            let (sock, _) = self.listener.accept()?;
+
+            let token = Token(self.next_conn_index);
+            self.next_conn_index += 1;
+
+            self.connections.insert(token, AttachConnection::new(sock));
+            Ok((self.connections.get(&token).unwrap(), token))
+        }
+    }
+
     pub struct Reactor {
         poll: Poll,
+        cont_pid: Pid,
         heartbeat: Duration,
         log_writer: LogWriter,
-        cont_pid: Pid,
         cont_status: Option<TerminationStatus>,
         cont_stdout: Option<IOStream>,
         cont_stderr: Option<IOStream>,
         sigfd: Option<Signalfd>,
-        attach_listener: Option<AttachListener>,
+        attach_server: Option<AttachServer>,
     }
 
     impl Reactor {
-        pub fn new(cont_pid: Pid, log_writer: LogWriter, heartbeat: Duration) -> Self {
+        pub fn new(cont_pid: Pid, heartbeat: Duration, log_writer: LogWriter) -> Self {
             Self {
                 poll: Poll::new().expect("mio::Poll::new() failed"),
+                cont_pid: cont_pid,
                 heartbeat: heartbeat,
                 log_writer: log_writer,
-                cont_pid: cont_pid,
                 cont_status: None,
                 cont_stdout: None,
                 cont_stderr: None,
                 sigfd: None,
-                attach_listener: None,
+                attach_server: None,
             }
         }
 
@@ -123,12 +151,12 @@ mod reactor {
             }
         }
 
-        pub fn register_attach_listener(&mut self, listener: AttachListener) {
-            self.attach_listener = Some(listener);
-            if let Some(listener) = &self.attach_listener {
+        pub fn register_attach_server(&mut self, server: AttachServer) {
+            self.attach_server = Some(server);
+            if let Some(server) = &self.attach_server {
                 self.poll
                     .register(
-                        listener,
+                        &server.listener,
                         TOKEN_ATTACH,
                         Ready::readable() | UnixReady::error(),
                         PollOpt::level(),
@@ -171,8 +199,8 @@ mod reactor {
                     TOKEN_STDOUT => self.handle_cont_stdout_event(&event),
                     TOKEN_STDERR => self.handle_cont_stderr_event(&event),
                     TOKEN_SIGNAL => self.handle_signalfd_event(&event),
-                    TOKEN_ATTACH => self.handle_attach_event(&event),
-                    _ => unreachable!(),
+                    TOKEN_ATTACH => self.handle_attach_listener_event(&event),
+                    _ => self.handle_attach_conn_event(&event),
                 }
             }
             event_count
@@ -248,28 +276,47 @@ mod reactor {
 
         fn handle_sigchld(&mut self) {
             if let Some(status) = get_child_termination_status() {
-                self.set_cont_status(status);
+                assert!(self.cont_status.is_none());
+                assert!(self.cont_pid == status.pid());
+                self.cont_status = Some(status);
             }
         }
 
-        fn set_cont_status(&mut self, status: TerminationStatus) {
-            assert!(self.cont_status.is_none());
-            assert!(self.cont_pid == status.pid());
-            self.cont_status = Some(status);
-        }
-
-        fn handle_attach_event(&mut self, event: &Event) {
-            if let Some(ref mut listener) = self.attach_listener {
+        fn handle_attach_listener_event(&mut self, event: &Event) {
+            if let Some(ref mut attach_server) = self.attach_server {
                 if !event.readiness().is_readable() {
                     error!(
                         "[shim] attach listener errored: {:?}",
-                        listener.take_error()
+                        attach_server.listener.take_error()
                     );
                     return;
                 }
-                match listener.accept() {
-                    Ok((_, addr)) => debug!("[shim] new attach socket conn {:?}", addr),
-                    Err(err) => error!("[shim] attach listener accept failed: {}", err),
+                match attach_server.accept() {
+                    Ok((conn, token)) => {
+                        debug!("[shim] new attach socket conn");
+                        self.poll
+                            .register(
+                                conn,
+                                token,
+                                Ready::readable()
+                                    | Ready::writable()
+                                    | UnixReady::error()
+                                    | UnixReady::hup(),
+                                PollOpt::level(),
+                            )
+                            .expect("mio::Poll::register(signalfd) failed");
+                    }
+                    Err(err) => error!("[shim] attach server accept failed: {}", err),
+                }
+            }
+        }
+
+        fn handle_attach_conn_event(&mut self, event: &Event) {
+            if let Some(ref mut attach_server) = self.attach_server {
+                if event.readiness().is_readable() {
+                    let conn = attach_server.connections.get_mut(&event.token()).unwrap();
+                    let buf = conn.read();
+                    debug!("READ FROM ATTACH SOCK: {}", buf);
                 }
             }
         }
