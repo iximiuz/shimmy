@@ -15,8 +15,7 @@ use nix::unistd::{execv, fork, ForkResult, Pid};
 use structopt::StructOpt;
 use syslog::{BasicLogger, Facility, Formatter3164};
 
-use shimmy::attach::Listener as AttachListener;
-use shimmy::container::serve_container;
+use shimmy::container::server::Server as ContainerServer;
 use shimmy::nixtools::misc::{
     _exit, session_start, set_child_subreaper, set_parent_death_signal, to_pipe_fd,
 };
@@ -25,7 +24,7 @@ use shimmy::nixtools::process::{
     TerminationStatus::{Exited, Signaled},
 };
 use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
-use shimmy::nixtools::stdio::{set_stdio, IOStream, IOStreams, StdioPipes};
+use shimmy::nixtools::stdio::{create_pipes, set_stdio, IStream, OStream};
 use shimmy::runtime::{await_runtime_termination, TerminationStatus as RuntimeTerminationStatus};
 use shimmy::syncpipe::SyncPipe;
 
@@ -85,16 +84,12 @@ fn main() {
     // Shim process (cont.)
     debug!("[shim] initializing...");
 
-    set_stdio(&IOStreams {
-        In: IOStream::DevNull,
-        Out: IOStream::DevNull,
-        Err: IOStream::DevNull,
-    });
+    set_stdio((IStream::DevNull(), OStream::DevNull(), OStream::DevNull()));
     session_start();
     set_child_subreaper();
 
     let oldmask = signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
-    let iopipes = StdioPipes::new();
+    let (iomaster, ioslave) = create_pipes();
 
     let runtime_pid = match fork() {
         Ok(ForkResult::Parent { child }) => child,
@@ -108,7 +103,7 @@ fn main() {
             set_parent_death_signal(SIGKILL);
 
             signals_restore(&oldmask);
-            set_stdio(&iopipes.slave);
+            set_stdio(ioslave.streams());
             exec_oci_runtime(RuntimeCommand {
                 runtime_path: opt.runtime_path,
                 runtime_args: opt.runtime_args,
@@ -122,39 +117,40 @@ fn main() {
     };
 
     // Shim process (cont.)
-    drop(iopipes.slave);
+    drop(ioslave);
 
     let mut sigfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
     match await_runtime_termination(&mut sigfd, runtime_pid) {
         RuntimeTerminationStatus::Solitary(Exited(.., 0), inflight) => {
             debug!("[shim] runtime terminated normally");
 
-            // Make sure attach socket is ready before reporting the readiness back.
-            let attach_listener = AttachListener::new(&opt.bundle.join("attach"));
-
             let container_pid = read_container_pidfile(opt.container_pidfile);
+
+            // Make sure we are ready to serve container
+            // before reporting so back to the manager
+            // (i.e. attach socket is ready, logger is ready, etc).
+            let mut container_server = ContainerServer::new(
+                container_pid,
+                opt.bundle.join("attach"),
+                opt.container_logfile,
+                iomaster,
+                sigfd,
+            );
+
             SyncPipe::new(to_pipe_fd(opt.syncpipe_fd)).report_container_pid(container_pid);
 
             if let Some(sig) = inflight {
                 deliver_inflight_signal(container_pid, sig);
             }
 
-            save_container_termination_status(
-                opt.container_exitfile,
-                serve_container(
-                    sigfd,
-                    attach_listener,
-                    container_pid,
-                    iopipes.master,
-                    opt.container_logfile,
-                ),
-            );
+            save_container_termination_status(opt.container_exitfile, container_server.run());
         }
 
         ts => {
             warn!("[shim] runtime terminated abnormally: {}", ts);
+            let (_, _, stderr) = iomaster.streams();
             SyncPipe::new(to_pipe_fd(opt.syncpipe_fd))
-                .report_abnormal_runtime_termination(ts, &iopipes.master.Err.read_all());
+                .report_abnormal_runtime_termination(ts, &stderr.read_all());
         }
     }
 

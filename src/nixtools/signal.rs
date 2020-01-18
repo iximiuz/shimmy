@@ -1,11 +1,11 @@
 use std::io;
 use std::os::unix::io::AsRawFd;
 
-use mio::event::Evented;
-use mio::unix::EventedFd;
-use mio::{Poll, PollOpt, Ready, Token};
-use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow, Signal};
-use nix::sys::signalfd;
+use mio::{unix::EventedFd, Evented, Poll, PollOpt, Ready, Token};
+use nix::sys::{
+    signal::{sigprocmask, SigSet, SigmaskHow, Signal},
+    signalfd,
+};
 
 pub fn signals_block(signals: &[Signal]) -> SigSet {
     let mut oldmask = SigSet::empty();

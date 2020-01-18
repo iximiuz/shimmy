@@ -17,6 +17,10 @@ structopt = "0.3"
 syslog = "5.0.0"
 
 [[bin]]
+name = "fifo1"
+path = "src/playground/fifo1.rs"
+
+[[bin]]
 name = "pipe1"
 path = "src/playground/pipe1.rs"
 
