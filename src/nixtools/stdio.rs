@@ -28,11 +28,13 @@ impl Drop for Stream {
 pub struct IStream(Stream);
 
 impl IStream {
-    pub fn DevNull() -> Self {
+    pub fn devnull() -> Self {
         Self(Stream::DevNull)
     }
+}
 
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+impl Read for IStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if let Self(Stream::Fd(fd)) = self {
             let mut file = unsafe { File::from_raw_fd(*fd) };
             let res = file.read(buf);
@@ -40,18 +42,6 @@ impl IStream {
             res
         } else {
             Ok(0)
-        }
-    }
-
-    pub fn read_all(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        if let Self(Stream::Fd(fd)) = self {
-            let mut file = unsafe { File::from_raw_fd(*fd) };
-            file.read_to_end(&mut buf).expect("read_to_end() failed");
-            mem::forget(file); // omit the destruciton of the file, i.e. no call to close(fd).
-            buf
-        } else {
-            buf
         }
     }
 }
@@ -68,7 +58,7 @@ impl AsRawFd for IStream {
 pub struct OStream(Stream);
 
 impl OStream {
-    pub fn DevNull() -> Self {
+    pub fn devnull() -> Self {
         Self(Stream::DevNull)
     }
 }

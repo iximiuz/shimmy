@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::fs;
+use std::io::Read;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -84,7 +85,7 @@ fn main() {
     // Shim process (cont.)
     debug!("[shim] initializing...");
 
-    set_stdio((IStream::DevNull(), OStream::DevNull(), OStream::DevNull()));
+    set_stdio((IStream::devnull(), OStream::devnull(), OStream::devnull()));
     session_start();
     set_child_subreaper();
 
@@ -148,9 +149,13 @@ fn main() {
 
         ts => {
             warn!("[shim] runtime terminated abnormally: {}", ts);
-            let (_, _, stderr) = iomaster.streams();
+            let (_, _, mut stderr) = iomaster.streams();
+            let mut buf = Vec::new();
+            if let Err(err) = stderr.read_to_end(&mut buf) {
+                warn!("[shim] failed to read runtime's STDERR: {}", err);
+            }
             SyncPipe::new(to_pipe_fd(opt.syncpipe_fd))
-                .report_abnormal_runtime_termination(ts, &stderr.read_all());
+                .report_abnormal_runtime_termination(ts, &buf);
         }
     }
 

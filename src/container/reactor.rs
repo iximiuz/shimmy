@@ -1,8 +1,11 @@
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixListener;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::rc::Rc;
 use std::time::Duration;
 
-use log::{debug, error};
+use log::{debug, error, warn};
 use mio::unix::{EventedFd, UnixReady};
 use mio::{Event, Events, Poll, PollOpt, Ready, Token};
 
@@ -24,7 +27,8 @@ pub struct Reactor {
     stderr_scatterer: io::Scatterer,
     signal_handler: signal::Handler,
     attach_listener: UnixListener,
-    last_token: Token,
+    attach_streams: HashMap<Token, RawFd>,
+    attach_last_token: Token,
 }
 
 impl Reactor {
@@ -78,7 +82,8 @@ impl Reactor {
             stderr_scatterer: stderr_scatterer,
             signal_handler: signal_handler,
             attach_listener: attach_listener,
-            last_token: TOKEN_UNUSED,
+            attach_streams: HashMap::new(),
+            attach_last_token: TOKEN_UNUSED,
         }
     }
 
@@ -117,13 +122,13 @@ impl Reactor {
                 TOKEN_STDERR => self.handle_stderr_event(event),
                 TOKEN_SIGNAL => self.signal_handler.handle_signal(),
                 TOKEN_ATTACH => self.handle_attach_listener_event(event),
-                token => self.handle_attach_stream_event(event),
+                _ => self.handle_attach_stream_event(event),
             }
         }
         event_count
     }
 
-    fn handle_stdout_event(&self, event: Event) {
+    fn handle_stdout_event(&mut self, event: Event) {
         if event.readiness().is_readable() {
             match self.stdout_scatterer.scatter() {
                 Ok(io::Status::Forwarded(bytes, eof)) => {
@@ -139,7 +144,7 @@ impl Reactor {
         }
     }
 
-    fn handle_stderr_event(&self, event: Event) {
+    fn handle_stderr_event(&mut self, event: Event) {
         if event.readiness().is_readable() {
             match self.stderr_scatterer.scatter() {
                 Ok(io::Status::Forwarded(bytes, eof)) => {
@@ -156,42 +161,46 @@ impl Reactor {
     }
 
     fn handle_attach_listener_event(&mut self, event: Event) {
-        // if event.is_readable() {
+        if UnixReady::from(event.readiness()).is_error() {
+            match self.attach_listener.take_error() {
+                Ok(None) => error!("[shim] attach listener event with error flag"),
+                Ok(Some(err)) => error!("[shim] attach listener error: {}", err),
+                Err(err) => error!("[shim] attach listener take_error() failed: {}", err),
+            }
+            return;
+        }
 
         match self.attach_listener.accept() {
             Ok((stream, _)) => {
-                debug!("[shim] new attach socket conn");
-                let token = self.next_token();
-                self.poll
-                    .register(
-                        &EventedFd(&stream.as_raw_fd()),
-                        token,
-                        Ready::readable() | UnixReady::hup(),
-                        PollOpt::level(),
-                    )
-                    .expect("mio::Poll::register(attach conn) failed");
-                // self.stdin_gatherer.add_source(token, conn);
-                // self.stdout_scatterer.add_sink(conn);
-                // self.stderr_scatterer.add_sink(conn);
+                debug!("[shim] new attach socket stream");
+                let token = self.register_attach_stream(stream.as_raw_fd());
+                let stream_rc: Rc<RefCell<UnixStream>> = Rc::new(RefCell::new(stream));
+                self.stdin_gatherer.add_source(token, stream_rc.clone());
+                self.stdout_scatterer.add_sink(stream_rc.clone());
+                self.stderr_scatterer.add_sink(stream_rc.clone());
             }
-
-            Err(err) => error!("[shim] attach server accept failed: {}", err),
+            Err(err) => error!("[shim] attach listener accept failed: {}", err),
         }
     }
 
-    fn handle_attach_stream_event(&self, event: Event) {
-        // if event.readiness().is_readable() {
-        //     match self.stdin_gatherer.gather(token) {
-        //         Ok(io::SourceEof) => (), // TODO: maybe close container' STDIN
-        //         Ok(io::Gathered(n)) => debug!("[shim] gathered {} byte(s) to container's STDIN", n),
-        //         Err(err) => error!("[shim] failed gathering container's STDIN: {}", err),
-        //     }
-        // } else if UnixReady::from(event.readiness()).is_hup() {
-        //     let conn = self.stdin_gatherer.remove_source(token);
-        //     self.poll
-        //         .deregister(&conn)
-        //         .expect("mio::Poll::deregister(attach conn) failed");
-        // }
+    fn handle_attach_stream_event(&mut self, event: Event) {
+        if event.readiness().is_readable() {
+            match self.stdin_gatherer.gather(event.token()) {
+                Ok(io::Status::Forwarded(bytes, eof)) => {
+                    debug!("[shim] gathered {} byte(s) to container's STDIN", bytes);
+                    if eof {
+                        // TODO: maybe close container' STDIN
+                        debug!("[shim] attach socket stream eof");
+                        self.stdin_gatherer.remove_source(event.token());
+                        self.deregister_attach_stream(event.token());
+                    }
+                }
+                Err(err) => error!("[shim] failed gathering container's STDIN: {}", err),
+            }
+        } else if UnixReady::from(event.readiness()).is_hup() {
+            self.stdin_gatherer.remove_source(event.token());
+            self.deregister_attach_stream(event.token());
+        }
     }
 
     fn deregister_stdout_scatterer(&self) {
@@ -208,8 +217,30 @@ impl Reactor {
         // TODO: self.stderr_scatterer = None;
     }
 
-    fn next_token(&mut self) -> Token {
-        self.last_token = Token(usize::from(self.last_token) + 1);
-        self.last_token
+    fn register_attach_stream(&mut self, fd: RawFd) -> Token {
+        self.attach_last_token = Token(usize::from(self.attach_last_token) + 1);
+
+        self.poll
+            .register(
+                &EventedFd(&fd),
+                self.attach_last_token,
+                Ready::readable() | UnixReady::error() | UnixReady::hup(),
+                PollOpt::level(),
+            )
+            .expect("mio::Poll::register(attach stream) failed");
+
+        self.attach_streams.insert(self.attach_last_token, fd);
+
+        self.attach_last_token
+    }
+
+    fn deregister_attach_stream(&mut self, token: Token) {
+        if let Some(fd) = self.attach_streams.remove(&token) {
+            self.poll
+                .deregister(&EventedFd(&fd))
+                .expect("mio::Poll::deregister(attach conn) failed");
+        } else {
+            warn!("[shim] attach stream with token {:?} not found", token);
+        }
     }
 }

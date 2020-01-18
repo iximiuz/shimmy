@@ -1,25 +1,42 @@
-use std::io::Result;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io::{Read, Result, Write};
 use std::os::unix::io::AsRawFd;
+use std::rc::Rc;
 
 use mio::{event::Evented, unix::EventedFd, Poll, PollOpt, Ready, Token};
 
 use crate::nixtools::stdio::{IStream, OStream};
 
 pub enum Status {
-    Forwarded(i32, bool),
+    // tuple (number of read bytes, met eof)
+    Forwarded(usize, bool),
 }
 
 pub struct Gatherer {
     sink: OStream,
+    sources: HashMap<Token, Rc<RefCell<dyn Read>>>,
 }
 
 impl Gatherer {
     pub fn new(sink: OStream) -> Self {
-        Self { sink: sink }
+        Self {
+            sink: sink,
+            sources: HashMap::new(),
+        }
     }
 
-    pub fn gather(&self) -> Result<Status> {
+    pub fn gather(&self, _token: Token) -> Result<Status> {
+        // TODO: implement me!
         Ok(Status::Forwarded(0, true))
+    }
+
+    pub fn add_source(&mut self, token: Token, source: Rc<RefCell<dyn Read>>) {
+        self.sources.insert(token, source);
+    }
+
+    pub fn remove_source(&mut self, token: Token) {
+        self.sources.remove(&token);
     }
 }
 
@@ -39,23 +56,33 @@ impl Evented for Gatherer {
 
 pub struct Scatterer {
     source: IStream,
+    sinks: HashMap<usize, Rc<RefCell<dyn Write>>>,
+    next_sink_seq_no: usize,
 }
 
 impl Scatterer {
     pub fn new(source: IStream) -> Self {
-        Self { source: source }
+        Self {
+            source: source,
+            sinks: HashMap::new(),
+            next_sink_seq_no: 0,
+        }
     }
 
-    pub fn scatter(&self) -> Result<Status> {
-        Ok(Status::Forwarded(0, true))
+    pub fn scatter(&mut self) -> Result<Status> {
+        let mut buf = [0; 16 * 1024];
+        let nread = self.source.read(&mut buf)?;
+        if nread > 0 {
+            self.sinks
+                .retain(|_, writer| writer.borrow_mut().write(&buf[..nread]).is_ok());
+        }
+        Ok(Status::Forwarded(nread, nread == 0))
     }
 
-    //     let mut buf = [0; 16 * 1024];
-    //     match stream.read(&mut buf) {
-    //         Ok(0) => (),
-    //         Ok(nread) => self.log_writer.write_container_stdout(&buf[..nread]),
-    //         Err(err) => warn!("[shim] container's STDOUT errored: {}", err),
-    //     }
+    pub fn add_sink(&mut self, sink: Rc<RefCell<dyn Write>>) {
+        self.sinks.insert(self.next_sink_seq_no, sink);
+        self.next_sink_seq_no += 1;
+    }
 }
 
 impl Evented for Scatterer {
@@ -71,42 +98,3 @@ impl Evented for Scatterer {
         EventedFd(&self.source.as_raw_fd()).deregister(poll)
     }
 }
-
-// impl Evented for IOStream {
-//     fn register(
-//         &self,
-//         poll: &Poll,
-//         token: Token,
-//         interest: Ready,
-//         opts: PollOpt,
-//     ) -> io::Result<()> {
-//         if let Self::Fd(fd) = self {
-//             EventedFd(fd).register(poll, token, interest, opts)
-//         } else {
-//             panic!("not implemented!");
-//         }
-//     }
-//
-//     fn reregister(
-//         &self,
-//         poll: &Poll,
-//         token: Token,
-//         interest: Ready,
-//         opts: PollOpt,
-//     ) -> io::Result<()> {
-//         if let Self::Fd(fd) = self {
-//             EventedFd(fd).reregister(poll, token, interest, opts)
-//         } else {
-//             panic!("not implemented!");
-//         }
-//     }
-//
-//     fn deregister(&self, poll: &Poll) -> io::Result<()> {
-//         if let Self::Fd(fd) = self {
-//             EventedFd(fd).deregister(poll)
-//         } else {
-//             panic!("not implemented!");
-//         }
-//     }
-// }
-//
