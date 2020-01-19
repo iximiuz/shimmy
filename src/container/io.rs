@@ -1,17 +1,24 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{Read, Result, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
+use std::result;
 
+use log::warn;
 use mio::{event::Evented, unix::EventedFd, Poll, PollOpt, Ready, Token};
 
 use crate::nixtools::stdio::{IStream, OStream};
 
-pub enum Status {
-    // tuple (number of read bytes, met eof)
-    Forwarded(usize, bool),
+const BUF_SIZE: usize = 32 * 1024;
+
+#[derive(Debug)]
+pub enum Error {
+    Sink(io::Error),
+    Source(io::Error),
 }
+
+type Result = result::Result<usize, Error>;
 
 pub struct Gatherer {
     sink: OStream,
@@ -26,9 +33,29 @@ impl Gatherer {
         }
     }
 
-    pub fn gather(&self, _token: Token) -> Result<Status> {
-        // TODO: implement me!
-        Ok(Status::Forwarded(0, true))
+    pub fn gather(&mut self, token: Token) -> Result {
+        match self.sources.get(&token) {
+            Some(source) => {
+                let mut buf = [0; BUF_SIZE];
+                let nread = source
+                    .borrow_mut()
+                    .read(&mut buf)
+                    .map_err(|err| Error::Source(err))?;
+
+                self.sink
+                    .write_all(&buf[..nread])
+                    .map_err(|err| Error::Sink(err))?;
+                Ok(nread)
+            }
+
+            None => {
+                warn!(
+                    "[shim] dubious, cannot find source stream for token {:?}",
+                    token
+                );
+                Ok(0)
+            }
+        }
     }
 
     pub fn add_source(&mut self, token: Token, source: Rc<RefCell<dyn Read>>) {
@@ -41,15 +68,27 @@ impl Gatherer {
 }
 
 impl Evented for Gatherer {
-    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> Result<()> {
+    fn register(
+        &self,
+        poll: &Poll,
+        token: Token,
+        interest: Ready,
+        opts: PollOpt,
+    ) -> io::Result<()> {
         EventedFd(&self.sink.as_raw_fd()).register(poll, token, interest, opts)
     }
 
-    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> Result<()> {
+    fn reregister(
+        &self,
+        poll: &Poll,
+        token: Token,
+        interest: Ready,
+        opts: PollOpt,
+    ) -> io::Result<()> {
         EventedFd(&self.sink.as_raw_fd()).reregister(poll, token, interest, opts)
     }
 
-    fn deregister(&self, poll: &Poll) -> Result<()> {
+    fn deregister(&self, poll: &Poll) -> io::Result<()> {
         EventedFd(&self.sink.as_raw_fd()).deregister(poll)
     }
 }
@@ -69,14 +108,24 @@ impl Scatterer {
         }
     }
 
-    pub fn scatter(&mut self) -> Result<Status> {
-        let mut buf = [0; 16 * 1024];
-        let nread = self.source.read(&mut buf)?;
+    pub fn scatter(&mut self) -> Result {
+        let mut buf = [0; BUF_SIZE];
+        let nread = self
+            .source
+            .read(&mut buf)
+            .map_err(|err| Error::Source(err))?;
         if nread > 0 {
-            self.sinks
-                .retain(|_, writer| writer.borrow_mut().write(&buf[..nread]).is_ok());
+            self.sinks.retain(
+                |idx, writer| match writer.borrow_mut().write_all(&buf[..nread]) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        warn!("[shim] failed to scatter STDIO to sink #{}: {}", idx, err);
+                        false
+                    }
+                },
+            );
         }
-        Ok(Status::Forwarded(nread, nread == 0))
+        Ok(nread)
     }
 
     pub fn add_sink(&mut self, sink: Rc<RefCell<dyn Write>>) {
@@ -86,15 +135,27 @@ impl Scatterer {
 }
 
 impl Evented for Scatterer {
-    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> Result<()> {
+    fn register(
+        &self,
+        poll: &Poll,
+        token: Token,
+        interest: Ready,
+        opts: PollOpt,
+    ) -> io::Result<()> {
         EventedFd(&self.source.as_raw_fd()).register(poll, token, interest, opts)
     }
 
-    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> Result<()> {
+    fn reregister(
+        &self,
+        poll: &Poll,
+        token: Token,
+        interest: Ready,
+        opts: PollOpt,
+    ) -> io::Result<()> {
         EventedFd(&self.source.as_raw_fd()).reregister(poll, token, interest, opts)
     }
 
-    fn deregister(&self, poll: &Poll) -> Result<()> {
+    fn deregister(&self, poll: &Poll) -> io::Result<()> {
         EventedFd(&self.source.as_raw_fd()).deregister(poll)
     }
 }

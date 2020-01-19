@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::mem;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
@@ -60,6 +60,23 @@ pub struct OStream(Stream);
 impl OStream {
     pub fn devnull() -> Self {
         Self(Stream::DevNull)
+    }
+}
+
+impl Write for OStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Self(Stream::Fd(fd)) = self {
+            let mut file = unsafe { File::from_raw_fd(*fd) };
+            let res = file.write(buf);
+            mem::forget(file); // omit the destruciton of the file, i.e. no call to close(fd).
+            res
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(()) // noop
     }
 }
 

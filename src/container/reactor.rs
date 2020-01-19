@@ -22,9 +22,9 @@ const TOKEN_UNUSED: Token = Token(1000);
 pub struct Reactor {
     poll: Poll,
     heartbeat: Duration,
-    stdin_gatherer: io::Gatherer,
-    stdout_scatterer: io::Scatterer,
-    stderr_scatterer: io::Scatterer,
+    stdin_gatherer: Option<io::Gatherer>,
+    stdout_scatterer: Option<io::Scatterer>,
+    stderr_scatterer: Option<io::Scatterer>,
     signal_handler: signal::Handler,
     attach_listener: UnixListener,
     attach_streams: HashMap<Token, RawFd>,
@@ -77,9 +77,9 @@ impl Reactor {
         Self {
             poll: poll,
             heartbeat: heartbeat,
-            stdin_gatherer: stdin_gatherer,
-            stdout_scatterer: stdout_scatterer,
-            stderr_scatterer: stderr_scatterer,
+            stdin_gatherer: Some(stdin_gatherer),
+            stdout_scatterer: Some(stdout_scatterer),
+            stderr_scatterer: Some(stderr_scatterer),
             signal_handler: signal_handler,
             attach_listener: attach_listener,
             attach_streams: HashMap::new(),
@@ -112,7 +112,9 @@ impl Reactor {
 
     fn poll_once(&mut self) -> i32 {
         let mut events = Events::with_capacity(128);
-        self.poll.poll(&mut events, Some(self.heartbeat)).unwrap();
+        self.poll
+            .poll(&mut events, Some(self.heartbeat))
+            .expect("mio::Poll::poll() failed");
 
         let mut event_count = 0;
         for event in events.iter() {
@@ -129,33 +131,51 @@ impl Reactor {
     }
 
     fn handle_stdout_event(&mut self, event: Event) {
+        if self.stdout_scatterer.is_none() {
+            warn!("[shim] dubious, got event on already closed STDOUT");
+            return;
+        }
+
         if event.readiness().is_readable() {
-            match self.stdout_scatterer.scatter() {
-                Ok(io::Status::Forwarded(bytes, eof)) => {
-                    debug!("[shim] scattered {} byte(s) from container's STDOUT", bytes);
-                    if eof {
+            match self.stdout_scatterer.as_mut().unwrap().scatter() {
+                Ok(nbytes) => {
+                    debug!(
+                        "[shim] scattered {} byte(s) from container's STDOUT",
+                        nbytes
+                    );
+                    if nbytes == 0 {
                         self.deregister_stdout_scatterer();
                     }
                 }
-                Err(err) => error!("[shim] failed scattering container's STDOUT: {}", err),
+                Err(err) => error!("[shim] failed scattering container's STDOUT: {:?}", err),
             }
         } else if UnixReady::from(event.readiness()).is_hup() {
+            debug!("[shim] STDOUT HUP");
             self.deregister_stdout_scatterer();
         }
     }
 
     fn handle_stderr_event(&mut self, event: Event) {
+        if self.stderr_scatterer.is_none() {
+            warn!("[shim] dubious, got event on already closed STDERR");
+            return;
+        }
+
         if event.readiness().is_readable() {
-            match self.stderr_scatterer.scatter() {
-                Ok(io::Status::Forwarded(bytes, eof)) => {
-                    debug!("[shim] scattered {} byte(s) from container's STDERR", bytes);
-                    if eof {
+            match self.stderr_scatterer.as_mut().unwrap().scatter() {
+                Ok(nbytes) => {
+                    debug!(
+                        "[shim] scattered {} byte(s) from container's STDERR",
+                        nbytes
+                    );
+                    if nbytes == 0 {
                         self.deregister_stderr_scatterer();
                     }
                 }
-                Err(err) => error!("[shim] failed scattering container's STDERR: {}", err),
+                Err(err) => error!("[shim] failed scattering container's STDERR: {:?}", err),
             }
         } else if UnixReady::from(event.readiness()).is_hup() {
+            debug!("[shim] STDERR HUP");
             self.deregister_stderr_scatterer();
         }
     }
@@ -175,46 +195,65 @@ impl Reactor {
                 debug!("[shim] new attach socket stream");
                 let token = self.register_attach_stream(stream.as_raw_fd());
                 let stream_rc: Rc<RefCell<UnixStream>> = Rc::new(RefCell::new(stream));
-                self.stdin_gatherer.add_source(token, stream_rc.clone());
-                self.stdout_scatterer.add_sink(stream_rc.clone());
-                self.stderr_scatterer.add_sink(stream_rc.clone());
+                if let Some(ref mut stdin_gatherer) = self.stdin_gatherer {
+                    stdin_gatherer.add_source(token, stream_rc.clone());
+                }
+                if let Some(ref mut stdout_scatterer) = self.stdout_scatterer {
+                    stdout_scatterer.add_sink(stream_rc.clone());
+                }
+                if let Some(ref mut stderr_scatterer) = self.stderr_scatterer {
+                    stderr_scatterer.add_sink(stream_rc.clone());
+                }
             }
             Err(err) => error!("[shim] attach listener accept failed: {}", err),
         }
     }
 
     fn handle_attach_stream_event(&mut self, event: Event) {
+        if self.stdin_gatherer.is_none() {
+            warn!("[shim] container's STDIN has been already closed");
+            return;
+        }
+
+        let stdin_gatherer = self.stdin_gatherer.as_mut().unwrap();
         if event.readiness().is_readable() {
-            match self.stdin_gatherer.gather(event.token()) {
-                Ok(io::Status::Forwarded(bytes, eof)) => {
-                    debug!("[shim] gathered {} byte(s) to container's STDIN", bytes);
-                    if eof {
+            match stdin_gatherer.gather(event.token()) {
+                Ok(nbytes) => {
+                    debug!("[shim] gathered {} byte(s) to container's STDIN", nbytes);
+                    if nbytes == 0 {
                         // TODO: maybe close container' STDIN
                         debug!("[shim] attach socket stream eof");
-                        self.stdin_gatherer.remove_source(event.token());
+                        stdin_gatherer.remove_source(event.token());
                         self.deregister_attach_stream(event.token());
                     }
                 }
-                Err(err) => error!("[shim] failed gathering container's STDIN: {}", err),
+                Err(io::Error::Source(err)) => {
+                    error!("[shim] attach socket stream read error: {}", err);
+                    stdin_gatherer.remove_source(event.token());
+                }
+                Err(io::Error::Sink(err)) => {
+                    error!("[shim] write to container's STDIN failed: {}", err);
+                }
             }
         } else if UnixReady::from(event.readiness()).is_hup() {
-            self.stdin_gatherer.remove_source(event.token());
+            debug!("[shim] attach socket stream HUP");
+            stdin_gatherer.remove_source(event.token());
             self.deregister_attach_stream(event.token());
         }
     }
 
-    fn deregister_stdout_scatterer(&self) {
+    fn deregister_stdout_scatterer(&mut self) {
         self.poll
-            .deregister(&self.stdout_scatterer)
+            .deregister(self.stdout_scatterer.as_ref().unwrap())
             .expect("mio::Poll::deregister(container STDOUT) failed");
-        // TODO: self.stdout_scatterer = None;
+        self.stdout_scatterer = None;
     }
 
-    fn deregister_stderr_scatterer(&self) {
+    fn deregister_stderr_scatterer(&mut self) {
         self.poll
-            .deregister(&self.stderr_scatterer)
+            .deregister(self.stderr_scatterer.as_ref().unwrap())
             .expect("mio::Poll::deregister(container STDERR) failed");
-        // TODO: self.stderr_scatterer = None;
+        self.stderr_scatterer = None;
     }
 
     fn register_attach_stream(&mut self, fd: RawFd) -> Token {
