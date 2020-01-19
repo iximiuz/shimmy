@@ -22,8 +22,7 @@ impl Logger {
         }
     }
 
-    pub fn write(&mut self, stream: &'static str, buf: &[u8]) -> io::Result<usize> {
-        let mut written = 0;
+    pub fn write(&mut self, stream: &'static str, buf: &[u8]) -> io::Result<()> {
         for line in buf.split(|c| *c == b'\n').filter(|l| l.len() > 0) {
             let message = format!(
                 "{} {} {}\n",
@@ -31,9 +30,9 @@ impl Logger {
                 stream,
                 String::from_utf8_lossy(line)
             );
-            written += self.file.write(message.as_bytes())?;
+            self.file.write_all(&message.as_bytes())?;
         }
-        Ok(written)
+        Ok(())
     }
 }
 
@@ -60,11 +59,11 @@ impl Writer {
 
 impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.logger.borrow_mut().write(self.stream, buf)
+        self.logger.borrow_mut().write(self.stream, &buf[1..])?;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // noop
-        Ok(())
+        Ok(()) // noop
     }
 }

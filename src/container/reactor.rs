@@ -23,6 +23,7 @@ pub struct Reactor {
     poll: Poll,
     heartbeat: Duration,
     stdin_gatherer: Option<io::Gatherer>,
+    stdin_once: bool,
     stdout_scatterer: Option<io::Scatterer>,
     stderr_scatterer: Option<io::Scatterer>,
     signal_handler: signal::Handler,
@@ -34,29 +35,34 @@ pub struct Reactor {
 impl Reactor {
     pub fn new(
         heartbeat: Duration,
-        stdin_gatherer: io::Gatherer,
-        stdout_scatterer: io::Scatterer,
-        stderr_scatterer: io::Scatterer,
+        stdin_gatherer: Option<io::Gatherer>,
+        stdin_once: bool,
+        stdout_scatterer: Option<io::Scatterer>,
+        stderr_scatterer: Option<io::Scatterer>,
         signal_handler: signal::Handler,
         attach_listener: UnixListener,
     ) -> Self {
         let poll = Poll::new().expect("mio::Poll::new() failed");
 
-        poll.register(
-            &stdout_scatterer,
-            TOKEN_STDOUT,
-            Ready::readable() | UnixReady::hup(),
-            PollOpt::level(),
-        )
-        .expect("mio::Poll::register(container stdout) failed");
+        if let Some(scatterer) = stdout_scatterer.as_ref() {
+            poll.register(
+                scatterer,
+                TOKEN_STDOUT,
+                Ready::readable() | UnixReady::hup(),
+                PollOpt::level(),
+            )
+            .expect("mio::Poll::register(container stdout) failed");
+        }
 
-        poll.register(
-            &stderr_scatterer,
-            TOKEN_STDERR,
-            Ready::readable() | UnixReady::hup(),
-            PollOpt::level(),
-        )
-        .expect("mio::Poll::register(container stderr) failed");
+        if let Some(scatterer) = stderr_scatterer.as_ref() {
+            poll.register(
+                scatterer,
+                TOKEN_STDERR,
+                Ready::readable() | UnixReady::hup(),
+                PollOpt::level(),
+            )
+            .expect("mio::Poll::register(container stderr) failed");
+        }
 
         poll.register(
             &signal_handler,
@@ -77,9 +83,10 @@ impl Reactor {
         Self {
             poll: poll,
             heartbeat: heartbeat,
-            stdin_gatherer: Some(stdin_gatherer),
-            stdout_scatterer: Some(stdout_scatterer),
-            stderr_scatterer: Some(stderr_scatterer),
+            stdin_gatherer: stdin_gatherer,
+            stdin_once: stdin_once,
+            stdout_scatterer: stdout_scatterer,
+            stderr_scatterer: stderr_scatterer,
             signal_handler: signal_handler,
             attach_listener: attach_listener,
             attach_streams: HashMap::new(),
@@ -221,15 +228,21 @@ impl Reactor {
                 Ok(nbytes) => {
                     debug!("[shim] gathered {} byte(s) to container's STDIN", nbytes);
                     if nbytes == 0 {
-                        // TODO: maybe close container' STDIN
                         debug!("[shim] attach socket stream eof");
                         stdin_gatherer.remove_source(event.token());
                         self.deregister_attach_stream(event.token());
+                        if self.stdin_once {
+                            self.stdin_gatherer = None;
+                        }
                     }
                 }
                 Err(io::Error::Source(err)) => {
                     error!("[shim] attach socket stream read error: {}", err);
                     stdin_gatherer.remove_source(event.token());
+                    self.deregister_attach_stream(event.token());
+                    if self.stdin_once {
+                        self.stdin_gatherer = None;
+                    }
                 }
                 Err(io::Error::Sink(err)) => {
                     error!("[shim] write to container's STDIN failed: {}", err);

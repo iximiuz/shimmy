@@ -1,6 +1,6 @@
 [package]
 name = "shimmy"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Ivan Velichko <iximiuz@gmail.com>"]
 edition = "2018"
 default-run = "shimmy"

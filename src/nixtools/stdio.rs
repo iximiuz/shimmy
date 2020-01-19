@@ -10,69 +10,47 @@ use nix::unistd::{close, dup2};
 
 use crate::nixtools::pipe::Pipe;
 
-enum Stream {
-    DevNull,
-    Fd(RawFd),
-}
+pub struct IStream(RawFd);
 
-impl Drop for Stream {
+impl Drop for IStream {
     fn drop(&mut self) {
-        if let Self::Fd(fd) = self {
-            if let Err(err) = close(*fd) {
-                error!("close({}) failed: {}", fd, err);
-            }
+        if let Err(err) = close(self.0) {
+            error!("istream close({}) failed: {}", self.0, err);
         }
-    }
-}
-
-pub struct IStream(Stream);
-
-impl IStream {
-    pub fn devnull() -> Self {
-        Self(Stream::DevNull)
     }
 }
 
 impl Read for IStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Self(Stream::Fd(fd)) = self {
-            let mut file = unsafe { File::from_raw_fd(*fd) };
-            let res = file.read(buf);
-            mem::forget(file); // omit the destruciton of the file, i.e. no call to close(fd).
-            res
-        } else {
-            Ok(0)
-        }
+        let mut file = unsafe { File::from_raw_fd(self.0) };
+        let res = file.read(buf);
+        mem::forget(file); // omit the destruciton of the file, i.e. no call to close(fd).
+        res
     }
 }
 
 impl AsRawFd for IStream {
     fn as_raw_fd(&self) -> RawFd {
-        if let Self(Stream::Fd(fd)) = self {
-            return *fd;
-        }
-        panic!("as_raw_fd() must not be called on /dev/null streams");
+        self.0
     }
 }
 
-pub struct OStream(Stream);
+pub struct OStream(RawFd);
 
-impl OStream {
-    pub fn devnull() -> Self {
-        Self(Stream::DevNull)
+impl Drop for OStream {
+    fn drop(&mut self) {
+        if let Err(err) = close(self.0) {
+            error!("ostream close({}) failed: {}", self.0, err);
+        }
     }
 }
 
 impl Write for OStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Self(Stream::Fd(fd)) = self {
-            let mut file = unsafe { File::from_raw_fd(*fd) };
-            let res = file.write(buf);
-            mem::forget(file); // omit the destruciton of the file, i.e. no call to close(fd).
-            res
-        } else {
-            Ok(0)
-        }
+        let mut file = unsafe { File::from_raw_fd(self.0) };
+        let res = file.write(buf);
+        mem::forget(file); // omit the destruciton of the file, i.e. no call to close(fd).
+        res
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -80,21 +58,12 @@ impl Write for OStream {
     }
 }
 
-impl AsRawFd for OStream {
-    fn as_raw_fd(&self) -> RawFd {
-        if let Self(Stream::Fd(fd)) = self {
-            return *fd;
-        }
-        panic!("as_raw_fd() must not be called on /dev/null streams");
-    }
-}
-
-pub fn set_stdio((ins, outs, errs): (IStream, OStream, OStream)) {
+pub fn set_stdio((ins, outs, errs): (Option<IStream>, Option<OStream>, Option<OStream>)) {
     match ins {
-        IStream(Stream::Fd(fd)) => {
+        Some(IStream(fd)) => {
             dup2(fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
         }
-        IStream(Stream::DevNull) => {
+        None => {
             let fd = open_dev_null(OFlag::O_RDONLY);
             dup2(fd, 0).expect("dup2(fd, STDIN_FILENO) failed");
             close(fd).expect("close('/dev/null (RDONLY)') failed");
@@ -102,10 +71,10 @@ pub fn set_stdio((ins, outs, errs): (IStream, OStream, OStream)) {
     }
 
     match outs {
-        OStream(Stream::Fd(fd)) => {
+        Some(OStream(fd)) => {
             dup2(fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
         }
-        OStream(Stream::DevNull) => {
+        None => {
             let fd = open_dev_null(OFlag::O_WRONLY);
             dup2(fd, 1).expect("dup2(fd, STDOUT_FILENO) failed");
             close(fd).expect("close('/dev/null (WRONLY)') failed");
@@ -113,10 +82,10 @@ pub fn set_stdio((ins, outs, errs): (IStream, OStream, OStream)) {
     }
 
     match errs {
-        OStream(Stream::Fd(fd)) => {
+        Some(OStream(fd)) => {
             dup2(fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
         }
-        OStream(Stream::DevNull) => {
+        None => {
             let fd = open_dev_null(OFlag::O_WRONLY);
             dup2(fd, 2).expect("dup2(fd, STDERR_FILENO) failed");
             close(fd).expect("close('/dev/null (WRONLY)') failed");
@@ -140,49 +109,69 @@ fn human_readable_mode(flags: OFlag) -> &'static str {
 }
 
 pub struct PipeMaster {
-    ins: OStream,
-    outs: IStream,
-    errs: IStream,
+    ins: Option<OStream>,
+    outs: Option<IStream>,
+    errs: Option<IStream>,
 }
 
 impl PipeMaster {
-    pub fn streams(self) -> (OStream, IStream, IStream) {
+    pub fn streams(self) -> (Option<OStream>, Option<IStream>, Option<IStream>) {
         (self.ins, self.outs, self.errs)
     }
 }
 
 pub struct PipeSlave {
-    ins: IStream,
-    outs: OStream,
-    errs: OStream,
+    ins: Option<IStream>,
+    outs: Option<OStream>,
+    errs: Option<OStream>,
 }
 
 impl PipeSlave {
-    pub fn streams(self) -> (IStream, OStream, OStream) {
+    pub fn streams(self) -> (Option<IStream>, Option<OStream>, Option<OStream>) {
         (self.ins, self.outs, self.errs)
     }
 }
 
-pub fn create_pipes() -> (PipeMaster, PipeSlave) {
-    let stdin = Pipe::new();
-    let stdout = Pipe::new();
-    let stderr = Pipe::new();
-
-    let master = PipeMaster {
-        ins: OStream(Stream::Fd(stdin.wr())),
-        outs: IStream(Stream::Fd(stdout.rd())),
-        errs: IStream(Stream::Fd(stderr.rd())),
+pub fn create_pipes(
+    use_stdin: bool,
+    use_stdout: bool,
+    use_stderr: bool,
+) -> (PipeMaster, PipeSlave) {
+    let mut master = PipeMaster {
+        ins: None,
+        outs: None,
+        errs: None,
     };
-    let slave = PipeSlave {
-        ins: IStream(Stream::Fd(stdin.rd())),
-        outs: OStream(Stream::Fd(stdout.wr())),
-        errs: OStream(Stream::Fd(stderr.wr())),
+    let mut slave = PipeSlave {
+        ins: None,
+        outs: None,
+        errs: None,
     };
 
-    // To prevent pipe objects calling close on underlying file descriptors:
-    mem::forget(stdin);
-    mem::forget(stdout);
-    mem::forget(stderr);
+    if use_stdin {
+        let stdin = Pipe::new();
+        master.ins = Some(OStream(stdin.wr()));
+        slave.ins = Some(IStream(stdin.rd()));
+
+        // To prevent pipe objects calling close on underlying file descriptors:
+        mem::forget(stdin);
+    }
+    if use_stdout {
+        let stdout = Pipe::new();
+        master.outs = Some(IStream(stdout.rd()));
+        slave.outs = Some(OStream(stdout.wr()));
+
+        // To prevent pipe objects calling close on underlying file descriptors:
+        mem::forget(stdout);
+    }
+    if use_stderr {
+        let stderr = Pipe::new();
+        master.errs = Some(IStream(stderr.rd()));
+        slave.errs = Some(OStream(stderr.wr()));
+
+        // To prevent pipe objects calling close on underlying file descriptors:
+        mem::forget(stderr);
+    }
 
     (master, slave)
 }

@@ -67,41 +67,32 @@ impl Gatherer {
     }
 }
 
-impl Evented for Gatherer {
-    fn register(
-        &self,
-        poll: &Poll,
-        token: Token,
-        interest: Ready,
-        opts: PollOpt,
-    ) -> io::Result<()> {
-        EventedFd(&self.sink.as_raw_fd()).register(poll, token, interest, opts)
-    }
-
-    fn reregister(
-        &self,
-        poll: &Poll,
-        token: Token,
-        interest: Ready,
-        opts: PollOpt,
-    ) -> io::Result<()> {
-        EventedFd(&self.sink.as_raw_fd()).reregister(poll, token, interest, opts)
-    }
-
-    fn deregister(&self, poll: &Poll) -> io::Result<()> {
-        EventedFd(&self.sink.as_raw_fd()).deregister(poll)
-    }
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum ScattererKind {
+    STDOUT = 1,
+    STDERR = 2,
 }
 
 pub struct Scatterer {
+    kind: ScattererKind,
     source: IStream,
     sinks: HashMap<usize, Rc<RefCell<dyn Write>>>,
     next_sink_seq_no: usize,
 }
 
 impl Scatterer {
-    pub fn new(source: IStream) -> Self {
+    pub fn stdout(source: IStream) -> Self {
+        Self::new(ScattererKind::STDOUT, source)
+    }
+
+    pub fn stderr(source: IStream) -> Self {
+        Self::new(ScattererKind::STDERR, source)
+    }
+
+    fn new(kind: ScattererKind, source: IStream) -> Self {
         Self {
+            kind: kind,
             source: source,
             sinks: HashMap::new(),
             next_sink_seq_no: 0,
@@ -112,18 +103,21 @@ impl Scatterer {
         let mut buf = [0; BUF_SIZE];
         let nread = self
             .source
-            .read(&mut buf)
+            .read(&mut buf[1..])
             .map_err(|err| Error::Source(err))?;
+
+        buf[0] = self.kind as u8;
+
         if nread > 0 {
-            self.sinks.retain(
-                |idx, writer| match writer.borrow_mut().write_all(&buf[..nread]) {
+            self.sinks.retain(|idx, writer| {
+                match writer.borrow_mut().write_all(&buf[..nread + 1]) {
                     Ok(_) => true,
                     Err(err) => {
                         warn!("[shim] failed to scatter STDIO to sink #{}: {}", idx, err);
                         false
                     }
-                },
-            );
+                }
+            });
         }
         Ok(nread)
     }

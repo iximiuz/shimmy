@@ -9,7 +9,7 @@ use nix::unistd::Pid;
 
 use crate::nixtools::process::TerminationStatus;
 use crate::nixtools::signal::Signalfd;
-use crate::nixtools::stdio::PipeMaster;
+use crate::nixtools::stdio::{IStream, OStream};
 
 use super::io;
 use super::logger::{Logger, Writer};
@@ -23,32 +23,53 @@ pub struct Server {
 impl Server {
     pub fn new<P: AsRef<Path>>(
         container_pid: Pid,
-        container_attach_path: P,
+        container_attachfile: P,
         container_logfile: P,
-        container_stdio: PipeMaster,
+        (container_stdin, container_stdout, container_stderr): (
+            Option<OStream>,
+            Option<IStream>,
+            Option<IStream>,
+        ),
+        stdin_once: bool,
         sigfd: Signalfd,
     ) -> Self {
-        let attach_listener = UnixListener::bind(container_attach_path).unwrap();
+        let attach_listener = UnixListener::bind(container_attachfile).unwrap();
         attach_listener
             .set_nonblocking(true)
             .expect("Couldn't set attach listener nonblocking");
 
         let logger = Rc::new(RefCell::new(Logger::new(container_logfile)));
 
-        let (stdin, stdout, stderr) = container_stdio.streams();
+        let stdin_gatherer = match container_stdin {
+            Some(stream) => Some(io::Gatherer::new(stream)),
+            None => None,
+        };
 
-        let mut scatterer_stdout = io::Scatterer::new(stdout);
-        scatterer_stdout.add_sink(Rc::new(RefCell::new(Writer::stdout(logger.clone()))));
+        let stdout_scatterer = match container_stdout {
+            Some(stream) => {
+                let mut scatterer = io::Scatterer::stdout(stream);
+                scatterer.add_sink(Rc::new(RefCell::new(Writer::stdout(logger.clone()))));
+                Some(scatterer)
+            }
+            None => None,
+        };
 
-        let mut scatterer_stderr = io::Scatterer::new(stderr);
-        scatterer_stderr.add_sink(Rc::new(RefCell::new(Writer::stderr(logger.clone()))));
+        let stderr_scatterer = match container_stderr {
+            Some(stream) => {
+                let mut scatterer = io::Scatterer::stderr(stream);
+                scatterer.add_sink(Rc::new(RefCell::new(Writer::stderr(logger.clone()))));
+                Some(scatterer)
+            }
+            None => None,
+        };
 
         Self {
             reactor: Reactor::new(
                 Duration::from_millis(5000),
-                io::Gatherer::new(stdin),
-                scatterer_stdout,
-                scatterer_stderr,
+                stdin_gatherer,
+                stdin_once,
+                stdout_scatterer,
+                stderr_scatterer,
                 signal::Handler::new(sigfd, container_pid),
                 attach_listener,
             ),

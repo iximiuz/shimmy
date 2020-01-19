@@ -25,7 +25,7 @@ use shimmy::nixtools::process::{
     TerminationStatus::{Exited, Signaled},
 };
 use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
-use shimmy::nixtools::stdio::{create_pipes, set_stdio, IStream, OStream};
+use shimmy::nixtools::stdio::{create_pipes, set_stdio};
 use shimmy::runtime::{await_runtime_termination, TerminationStatus as RuntimeTerminationStatus};
 use shimmy::syncpipe::SyncPipe;
 
@@ -63,6 +63,15 @@ struct CliOpt {
 
     #[structopt(long = "container-exitfile", parse(from_os_str))]
     container_exitfile: PathBuf,
+
+    #[structopt(long = "container-attachfile", parse(from_os_str))]
+    container_attachfile: PathBuf,
+
+    #[structopt(long = "stdin")]
+    stdin: bool,
+
+    #[structopt(long = "stdin-once")]
+    stdin_once: bool,
 }
 
 fn main() {
@@ -85,12 +94,12 @@ fn main() {
     // Shim process (cont.)
     debug!("[shim] initializing...");
 
-    set_stdio((IStream::devnull(), OStream::devnull(), OStream::devnull()));
+    set_stdio((None, None, None));
     session_start();
     set_child_subreaper();
 
     let oldmask = signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
-    let (iomaster, ioslave) = create_pipes();
+    let (iomaster, ioslave) = create_pipes(opt.stdin, true, true);
 
     let runtime_pid = match fork() {
         Ok(ForkResult::Parent { child }) => child,
@@ -132,9 +141,10 @@ fn main() {
             // (i.e. attach socket is ready, logger is ready, etc).
             let mut container_server = ContainerServer::new(
                 container_pid,
-                opt.bundle.join("attach"),
+                opt.container_attachfile,
                 opt.container_logfile,
-                iomaster,
+                iomaster.streams(),
+                opt.stdin_once,
                 sigfd,
             );
 
@@ -149,10 +159,11 @@ fn main() {
 
         ts => {
             warn!("[shim] runtime terminated abnormally: {}", ts);
-            let (_, _, mut stderr) = iomaster.streams();
             let mut buf = Vec::new();
-            if let Err(err) = stderr.read_to_end(&mut buf) {
-                warn!("[shim] failed to read runtime's STDERR: {}", err);
+            if let (_, _, Some(mut stderr)) = iomaster.streams() {
+                if let Err(err) = stderr.read_to_end(&mut buf) {
+                    warn!("[shim] failed to read runtime's STDERR: {}", err);
+                }
             }
             SyncPipe::new(to_pipe_fd(opt.syncpipe_fd))
                 .report_abnormal_runtime_termination(ts, &buf);
