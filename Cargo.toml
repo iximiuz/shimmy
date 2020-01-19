@@ -1,6 +1,6 @@
 [package]
 name = "shimmy"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Ivan Velichko <iximiuz@gmail.com>"]
 edition = "2018"
 default-run = "shimmy"
@@ -15,6 +15,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 structopt = "0.3"
 syslog = "5.0.0"
+
+[[bin]]
+name = "fifo1"
+path = "src/playground/fifo1.rs"
 
 [[bin]]
 name = "pipe1"

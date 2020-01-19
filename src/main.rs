@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::fs;
+use std::io::Read;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -15,7 +16,7 @@ use nix::unistd::{execv, fork, ForkResult, Pid};
 use structopt::StructOpt;
 use syslog::{BasicLogger, Facility, Formatter3164};
 
-use shimmy::container::serve_container;
+use shimmy::container::server::Server as ContainerServer;
 use shimmy::nixtools::misc::{
     _exit, session_start, set_child_subreaper, set_parent_death_signal, to_pipe_fd,
 };
@@ -24,7 +25,7 @@ use shimmy::nixtools::process::{
     TerminationStatus::{Exited, Signaled},
 };
 use shimmy::nixtools::signal::{signals_block, signals_restore, Signalfd};
-use shimmy::nixtools::stdio::{set_stdio, IOStream, IOStreams, StdioPipes};
+use shimmy::nixtools::stdio::{create_pipes, set_stdio};
 use shimmy::runtime::{await_runtime_termination, TerminationStatus as RuntimeTerminationStatus};
 use shimmy::syncpipe::SyncPipe;
 
@@ -62,6 +63,15 @@ struct CliOpt {
 
     #[structopt(long = "container-exitfile", parse(from_os_str))]
     container_exitfile: PathBuf,
+
+    #[structopt(long = "container-attachfile", parse(from_os_str))]
+    container_attachfile: PathBuf,
+
+    #[structopt(long = "stdin")]
+    stdin: bool,
+
+    #[structopt(long = "stdin-once")]
+    stdin_once: bool,
 }
 
 fn main() {
@@ -84,15 +94,12 @@ fn main() {
     // Shim process (cont.)
     debug!("[shim] initializing...");
 
-    set_stdio(&IOStreams {
-        In: IOStream::DevNull,
-        Out: IOStream::DevNull,
-        Err: IOStream::DevNull,
-    });
+    set_stdio((None, None, None));
     session_start();
     set_child_subreaper();
+
     let oldmask = signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
-    let iopipes = StdioPipes::new();
+    let (iomaster, ioslave) = create_pipes(opt.stdin, true, true);
 
     let runtime_pid = match fork() {
         Ok(ForkResult::Parent { child }) => child,
@@ -106,7 +113,7 @@ fn main() {
             set_parent_death_signal(SIGKILL);
 
             signals_restore(&oldmask);
-            set_stdio(&iopipes.slave);
+            set_stdio(ioslave.streams());
             exec_oci_runtime(RuntimeCommand {
                 runtime_path: opt.runtime_path,
                 runtime_args: opt.runtime_args,
@@ -120,7 +127,7 @@ fn main() {
     };
 
     // Shim process (cont.)
-    drop(iopipes.slave);
+    drop(ioslave);
 
     let mut sigfd = Signalfd::new(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
     match await_runtime_termination(&mut sigfd, runtime_pid) {
@@ -128,22 +135,38 @@ fn main() {
             debug!("[shim] runtime terminated normally");
 
             let container_pid = read_container_pidfile(opt.container_pidfile);
+
+            // Make sure we are ready to serve container
+            // before reporting so back to the manager
+            // (i.e. attach socket is ready, logger is ready, etc).
+            let mut container_server = ContainerServer::new(
+                container_pid,
+                opt.container_attachfile,
+                opt.container_logfile,
+                iomaster.streams(),
+                opt.stdin_once,
+                sigfd,
+            );
+
             SyncPipe::new(to_pipe_fd(opt.syncpipe_fd)).report_container_pid(container_pid);
 
             if let Some(sig) = inflight {
                 deliver_inflight_signal(container_pid, sig);
             }
 
-            save_container_termination_status(
-                opt.container_exitfile,
-                serve_container(sigfd, container_pid, iopipes.master, opt.container_logfile),
-            );
+            save_container_termination_status(opt.container_exitfile, container_server.run());
         }
 
         ts => {
             warn!("[shim] runtime terminated abnormally: {}", ts);
+            let mut buf = Vec::new();
+            if let (_, _, Some(mut stderr)) = iomaster.streams() {
+                if let Err(err) = stderr.read_to_end(&mut buf) {
+                    warn!("[shim] failed to read runtime's STDERR: {}", err);
+                }
+            }
             SyncPipe::new(to_pipe_fd(opt.syncpipe_fd))
-                .report_abnormal_runtime_termination(ts, &iopipes.master.Err.read_all());
+                .report_abnormal_runtime_termination(ts, &buf);
         }
     }
 
