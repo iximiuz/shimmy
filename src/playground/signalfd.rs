@@ -9,7 +9,7 @@ use nix::sys::wait::{waitpid, WaitPidFlag};
 use nix::unistd::{fork, getpid, ForkResult, Pid};
 use nix::{self};
 
-use shimmy::nixtools::{set_child_subreaper, signals_block};
+use shimmy::nixtools::{misc::set_child_subreaper, signal::signals_block};
 
 fn main() {
     println!("Hi there! My pid is {}", getpid());
