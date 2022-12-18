@@ -16,7 +16,7 @@ fn main() {
         Err(err) => panic!("[main] pipe() failed: {}", err),
     };
 
-    match fork() {
+    match unsafe { fork() } {
         Ok(ForkResult::Parent { child, .. }) => {
             println!("[main] Forked new child with pid {}", child);
         }

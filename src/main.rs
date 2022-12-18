@@ -81,7 +81,7 @@ fn main() {
     setup_logger(opt.loglevel);
     info!("[main] shimmy says hi!");
 
-    match fork() {
+    match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
             // Main process (cont.)
             write_runtime_pidfile(opt.pidfile, child);
@@ -101,7 +101,7 @@ fn main() {
     let oldmask = signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
     let (iomaster, ioslave) = create_pipes(opt.stdin, true, true);
 
-    let runtime_pid = match fork() {
+    let runtime_pid = match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => child,
         Ok(ForkResult::Child) => {
             // Container runtime process

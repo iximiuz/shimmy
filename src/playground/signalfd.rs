@@ -18,11 +18,11 @@ fn main() {
     signals_block(&[SIGCHLD, SIGINT, SIGQUIT, SIGTERM]);
     println!("Signals have been blocked! Waiting for 10 seconds...");
 
-    match fork() {
+    match unsafe { fork() } {
         Ok(ForkResult::Parent { .. }) => (),
         Ok(ForkResult::Child) => {
             println!("[child] Hi there! My pid is {}", getpid());
-            match fork() {
+            match unsafe { fork() } {
                 Ok(ForkResult::Parent { .. }) => (),
                 Ok(ForkResult::Child) => {
                     println!("[grandchild] Hi there! My pid is {}", getpid());
