@@ -1,6 +1,5 @@
 use std::fmt;
 
-use nix::errno::Errno;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
@@ -47,7 +46,7 @@ pub fn get_child_termination_status() -> Option<TerminationStatus> {
 
         Ok(_) => None, // non-terminal state change
 
-        Err(nix::Error::Sys(Errno::ECHILD)) => None, // no children left
+        Err(nix::Error::ECHILD) => None, // no children left
 
         Err(err) => panic!("waitpid() failed with error {:?}", err),
     }
@@ -62,7 +61,7 @@ pub fn kill(pid: Pid, sig: Signal) -> nix::Result<KillResult> {
     match signal::kill(pid, sig) {
         Ok(_) => Ok(KillResult::Delivered),
 
-        Err(nix::Error::Sys(Errno::ESRCH)) => Ok(KillResult::ProcessNotFound),
+        Err(nix::Error::ESRCH) => Ok(KillResult::ProcessNotFound),
 
         Err(err) => Err(err),
     }

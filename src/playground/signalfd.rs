@@ -2,7 +2,6 @@ use std::process::exit;
 use std::thread::sleep;
 use std::time::Duration;
 
-use libc;
 use nix::sys::signal::Signal::{SIGCHLD, SIGINT, SIGQUIT, SIGTERM};
 use nix::sys::signalfd::*;
 use nix::sys::wait::{waitpid, WaitPidFlag};
@@ -54,11 +53,8 @@ fn main() {
                 while sig.ssi_signo == SIGCHLD as u32 {
                     match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
                         Ok(res) => println!("waitpid() returned {:?}", res),
-                        Err(nix::Error::Sys(errno)) => {
-                            if errno as libc::c_int == libc::ECHILD {
-                                break;
-                            }
-                            panic!("waitpid() failed {:?}", errno);
+                        Err(nix::Error::ECHILD) => {
+                            break;
                         }
                         Err(err) => panic!("waitpid() failed {:?}", err),
                     }
