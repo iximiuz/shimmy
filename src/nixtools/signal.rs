@@ -6,6 +6,7 @@ use nix::sys::{
     signal::{sigprocmask, SigSet, SigmaskHow, Signal},
     signalfd,
 };
+use std::convert::TryFrom;
 
 pub fn signals_block(signals: &[Signal]) -> SigSet {
     let mut oldmask = SigSet::empty();
@@ -36,7 +37,7 @@ impl Signalfd {
     pub fn read_signal(&mut self) -> Signal {
         match self.0.read_signal() {
             Ok(Some(sinfo)) => {
-                Signal::from_c_int(sinfo.ssi_signo as libc::c_int).expect("unexpected signo")
+                Signal::try_from(sinfo.ssi_signo as libc::c_int).expect("unexpected signo")
             }
             Ok(None) => panic!("wtf? We are in blocking mode"),
             Err(err) => panic!("read(signalfd) failed {}", err),
